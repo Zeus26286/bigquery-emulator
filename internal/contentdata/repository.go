@@ -79,6 +79,14 @@ func (r *Repository) tablePath(projectID, datasetID, tableID string) (string, er
 	return strings.Join(tablePath, "."), nil
 }
 
+// TablePath returns the fully-qualified path of a table for embedding between
+// backticks. Always address a table through it: a bare table ID is resolved
+// by name across datasets and can hit another dataset's table of the same
+// name.
+func (r *Repository) TablePath(projectID, datasetID, tableID string) (string, error) {
+	return r.tablePath(projectID, datasetID, tableID)
+}
+
 func (r *Repository) routinePath(projectID, datasetID, routineID string) (string, error) {
 	var routinePath []string
 	if projectID != "" {
