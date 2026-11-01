@@ -21,7 +21,6 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/goccy/go-json"
-	"github.com/goccy/googlesqlite"
 	"go.uber.org/zap"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/iterator"
@@ -1740,6 +1739,21 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		return nil, fmt.Errorf("unspecified job configuration query")
 	}
 	queryProjectID, datasetID := queryProjectAndDataset(job.Configuration.Query.DefaultDataset, r.project.ID)
+	startTime := time.Now()
+	queryText := job.Configuration.Query.Query
+	var (
+		alterPlan *alterTablePlan
+		planErr   error
+	)
+	if !job.Configuration.DryRun && looksLikeAlter(queryText) {
+		// The plan is built from the metadata before the rebuild runs, so
+		// ALTER TABLE statements must not interleave.
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+		// Plan before the job transaction starts: planning reads the
+		// metadata through another connection.
+		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -1750,15 +1764,30 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	}
 	defer tx.RollbackIfNotCommitted()
 	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
-	startTime := time.Now()
-	response, jobErr := r.server.contentRepo.Query(
-		ctx,
-		tx,
-		queryProjectID,
-		datasetID,
-		job.Configuration.Query.Query,
-		job.Configuration.Query.QueryParameters,
+	var (
+		response *internaltypes.QueryResponse
+		jobErr   error
 	)
+	switch {
+	case planErr != nil:
+		jobErr = planErr
+	case alterPlan != nil && alterPlan.sql == "":
+		response = emptyDDLResponse()
+	default:
+		if alterPlan != nil {
+			queryText = alterPlan.sql
+		}
+		// On error, response may carry the catalog changes of the
+		// statements that ran before the failure.
+		response, jobErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			queryText,
+			job.Configuration.Query.QueryParameters,
+		)
+	}
 	endTime := time.Now()
 	if job.JobReference.JobId == "" {
 		job.JobReference.JobId = randomID() // generate job id
@@ -1834,8 +1863,13 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	}
 	job.Status = status
 	var totalBytes int64
-	if response != nil {
+	if response != nil && jobErr == nil {
 		totalBytes = response.TotalBytes
+	}
+	jobResponse := response
+	if jobErr != nil {
+		// A failed job records no result.
+		jobResponse = nil
 	}
 	job.Statistics = &bigqueryv2.JobStatistics{
 		Query: &bigqueryv2.JobStatistics2{
@@ -1849,6 +1883,22 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		EndTime:             endTime.Unix(),
 		TotalBytesProcessed: totalBytes,
 	}
+	syncResponse := response
+	if alterPlan != nil && alterPlan.sql != "" && jobErr != nil && !job.Configuration.DryRun {
+		// ALTER TABLE is atomic: discard what the failed rebuild did and
+		// record only the job.
+		_ = tx.RollbackIfNotCommitted()
+		syncResponse = nil
+		conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get connection: %w", err)
+		}
+		tx, err = conn.Begin(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start transaction: %w", err)
+		}
+		defer tx.RollbackIfNotCommitted()
+	}
 	if err := r.project.AddJob(
 		ctx,
 		tx.Tx(),
@@ -1857,24 +1907,59 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			r.project.ID,
 			job.JobReference.JobId,
 			job,
-			response,
+			jobResponse,
 			jobErr,
 		),
 	); err != nil {
 		return nil, fmt.Errorf("failed to add job: %w", err)
 	}
 	if !job.Configuration.DryRun {
+		// The statements of a failed script that ran before the failure
+		// are committed too, as in BigQuery, so their catalog changes are
+		// synced as well.
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
-		if response != nil && response.ChangedCatalog.Changed() {
-			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
-				return nil, err
-			}
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, syncResponse, alterPlan, jobErr); err != nil {
+			return nil, err
 		}
 	}
 
 	return job, nil
+}
+
+// emptyDDLResponse is the result of a DDL statement that has nothing to do.
+func emptyDDLResponse() *internaltypes.QueryResponse {
+	return &internaltypes.QueryResponse{
+		Schema:      &bigqueryv2.TableSchema{},
+		JobComplete: true,
+	}
+}
+
+// syncQueryCatalog updates the table metadata and googlesqlite's analyzer
+// catalog after a query committed. response may be a partial response of a
+// failed query (queryErr != nil); an error while syncing it is then only
+// logged, so that it does not hide the query's own error.
+func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID string, response *internaltypes.QueryResponse, plan *alterTablePlan, queryErr error) error {
+	if response == nil {
+		return nil
+	}
+	var skip skipTableFunc
+	if plan != nil && plan.sql != "" {
+		skip = plan.skips
+	}
+	res, err := syncCatalog(ctx, server, response.ChangedCatalog, skip)
+	if err == nil && skip != nil && queryErr == nil {
+		err = plan.applyMetadata(ctx, server, response.ChangedCatalog)
+	}
+	if err != nil {
+		if queryErr == nil {
+			return err
+		}
+		logger.Logger(ctx).Error("failed to sync the catalog of a failed query", zap.Error(err))
+	}
+	afterCatalogSync(ctx, server, projectID, datasetID, res)
+	return nil
 }
 
 func queryProjectAndDataset(defaultDataset *bigqueryv2.DatasetReference, fallbackProjectID string) (string, string) {
@@ -1887,104 +1972,6 @@ func queryProjectAndDataset(defaultDataset *bigqueryv2.DatasetReference, fallbac
 		datasetID = defaultDataset.DatasetId
 	}
 	return projectID, datasetID
-}
-
-func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog) error {
-	for _, table := range cat.Table.Added {
-		if err := addTableMetadata(ctx, server, table); err != nil {
-			return err
-		}
-	}
-	for _, table := range cat.Table.Deleted {
-		if err := deleteTableMetadata(ctx, server, table); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func addTableMetadata(ctx context.Context, server *Server, spec *googlesqlite.TableSpec) error {
-	if len(spec.NamePath) != 3 {
-		return fmt.Errorf("unexpected table name path: %v", spec.NamePath)
-	}
-	projectID := spec.NamePath[0]
-	datasetID := spec.NamePath[1]
-	tableID := spec.NamePath[2]
-	project, err := server.metaRepo.FindProject(ctx, projectID)
-	if err != nil {
-		return err
-	}
-	dataset := project.Dataset(datasetID)
-	if dataset == nil {
-		return fmt.Errorf("dataset %s is not found", datasetID)
-	}
-	fields := make([]*bigqueryv2.TableFieldSchema, 0, len(spec.Columns))
-	for _, column := range spec.Columns {
-		fields = append(fields, types.TableFieldSchemaFromColumnType(column.Name, column.Type))
-	}
-	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.RollbackIfNotCommitted()
-	table := &bigqueryv2.Table{
-		TableReference: &bigqueryv2.TableReference{
-			ProjectId: projectID,
-			DatasetId: datasetID,
-			TableId:   tableID,
-		},
-		Schema: &bigqueryv2.TableSchema{Fields: fields},
-	}
-	// A view created by a CREATE VIEW DDL statement must be recorded as a
-	// view so it is typed correctly and dropped with DROP VIEW.
-	if spec.IsView {
-		table.View = &bigqueryv2.ViewDefinition{Query: spec.Query}
-	}
-	if _, err := createTableMetadata(ctx, tx, server, project, dataset, table); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func deleteTableMetadata(ctx context.Context, server *Server, spec *googlesqlite.TableSpec) error {
-	if len(spec.NamePath) != 3 {
-		return fmt.Errorf("unexpected table name path: %v", spec.NamePath)
-	}
-	projectID := spec.NamePath[0]
-	datasetID := spec.NamePath[1]
-	tableID := spec.NamePath[2]
-	project, err := server.metaRepo.FindProject(ctx, projectID)
-	if err != nil {
-		return err
-	}
-	dataset := project.Dataset(datasetID)
-	if dataset == nil {
-		return fmt.Errorf("dataset %s is not found", datasetID)
-	}
-	table := dataset.Table(tableID)
-	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.RollbackIfNotCommitted()
-	if err := table.Delete(ctx, tx.Tx()); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
 }
 
 // addQueryResultToDynamicDestinationTable materializes the result of a query
@@ -2122,6 +2109,22 @@ type jobsQueryRequest struct {
 
 func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*internaltypes.QueryResponse, error) {
 	queryProjectID, datasetID := queryProjectAndDataset(r.queryRequest.DefaultDataset, r.project.ID)
+	startTime := time.Now()
+	queryText := r.queryRequest.Query
+	var alterPlan *alterTablePlan
+	if !r.queryRequest.DryRun && looksLikeAlter(queryText) {
+		// The plan is built from the metadata before the rebuild runs, so
+		// ALTER TABLE statements must not interleave.
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+		// Plan before the transaction starts: planning reads the metadata
+		// through another connection.
+		plan, err := planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+		if err != nil {
+			return nil, err
+		}
+		alterPlan = plan
+	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, err
@@ -2131,16 +2134,37 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		return nil, err
 	}
 	defer tx.RollbackIfNotCommitted()
-	startTime := time.Now()
-	response, queryErr := r.server.contentRepo.Query(
-		ctx,
-		tx,
-		queryProjectID,
-		datasetID,
-		r.queryRequest.Query,
-		r.queryRequest.QueryParameters,
+	var (
+		response *internaltypes.QueryResponse
+		queryErr error
 	)
+	if alterPlan != nil && alterPlan.sql == "" {
+		response = emptyDDLResponse()
+	} else {
+		if alterPlan != nil {
+			queryText = alterPlan.sql
+		}
+		response, queryErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			queryText,
+			r.queryRequest.QueryParameters,
+		)
+	}
 	if queryErr != nil {
+		// Keep what the statements before the failure did, as jobs.insert
+		// and BigQuery do. Rolling back would also leave googlesqlite's
+		// in-memory catalog ahead of the tables. A failed ALTER TABLE
+		// rebuild is rolled back instead, since ALTER TABLE is atomic.
+		if !r.queryRequest.DryRun && (alterPlan == nil || alterPlan.sql == "") {
+			if err := tx.Commit(); err != nil {
+				logger.Logger(ctx).Error("failed to commit a failed query", zap.Error(err))
+			} else {
+				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, response, alterPlan, queryErr)
+			}
+		}
 		return nil, queryErr
 	}
 	endTime := time.Now()
@@ -2225,10 +2249,8 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		if response.ChangedCatalog.Changed() {
-			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
-				return nil, err
-			}
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, response, alterPlan, nil); err != nil {
+			return nil, err
 		}
 	}
 	response.Rows = internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp)
@@ -2946,7 +2968,7 @@ func (h *tablesDeleteHandler) Handle(ctx context.Context, r *tablesDeleteRequest
 	}
 	defer tx.RollbackIfNotCommitted()
 	// delete table metadata
-	if err := r.table.Delete(ctx, tx.Tx()); err != nil {
+	if err := r.dataset.DeleteTable(ctx, tx.Tx(), r.table.ID); err != nil {
 		return err
 	}
 	// delete table
