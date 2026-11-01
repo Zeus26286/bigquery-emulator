@@ -1,1 +1,2 @@
+json:2.10.2
 google-cloud-bigquery:1.50.0
