@@ -15,7 +15,7 @@ means the bug was confirmed against that build.
 | --- | --- | --- | --- | --- |
 | 1 | ✅ | `tabledata.list` returns another dataset's table of the same name | Reproduced | #532 |
 | 2 | ✅ | BYTES values are base64-encoded twice | Reproduced | #498 |
-| 3 | ⬜ | DDL doesn't keep the table catalog in sync (`CREATE OR REPLACE`, `ALTER TABLE`, failed scripts) | Reproduced | #519, #481, #523; PRs #519, #495, #522 |
+| 3 | ✅ | DDL doesn't keep the table catalog in sync (`CREATE OR REPLACE`, `ALTER TABLE`, failed scripts) | Reproduced | #519, #481, #523; PRs #519, #495, #522 |
 | 4 | ⬜ | Invalid queries are reported as `jobInternalError` instead of `invalidQuery` | Reproduced | #316; PR #521 |
 | 5 | ⬜ | The declared type of a query parameter is ignored | Reproduced (NUMERIC) | #511, #509; PRs #516, #525, #526 |
 | 6 | ⬜ | Default time zone is America/Los_Angeles instead of UTC | Reproduced | #500 |
@@ -64,6 +64,28 @@ checked for the same bug.
 
 Everyday SQL in dbt and migrations; likely one root cause. Open PRs: #519,
 #495, #522.
+
+**Fixed on branch `fix/ddl-catalog-sync` (0d3e606; fork PR
+[Zeus26286/bigquery-emulator#1](https://github.com/Zeus26286/bigquery-emulator/pull/1)).**
+Three catalogs drifted apart: SQLite, googlesqlite's in-memory analyzer
+catalog, and the emulator's metadata, which was synced only after a successful
+query. The sync is now idempotent and runs in one transaction. A re-added
+table replaces the old one, `IF NOT EXISTS` keeps the existing table, and the
+analyzer is rebuilt afterwards. `ALTER TABLE` ADD/DROP/RENAME COLUMN, RENAME
+TO and `IF [NOT] EXISTS` are rewritten into a rebuild that keeps the rows,
+descriptions, modes, partitioning and clustering. A script that fails partway
+now commits what ran and syncs the catalog on both jobs.insert and jobs.query,
+as in BigQuery; this changes jobs.query, which used to roll back. Regression
+tests: `TestCreateOrReplaceTableSyncsCatalog`,
+`TestCreateTableIfNotExistsKeepsExistingTable`, `TestAlterTableSyncsCatalog`,
+`TestAlterTableEdgeCases`, `TestFailedScriptSyncsCatalog`.
+
+Still needing googlesqlite fixes:
+- `ALTER` inside a multi-statement script is a no-op.
+- A failure before a script's last statement leaves metadata stale until the
+  next DDL on that table.
+- After `CREATE OR REPLACE`, later statements in the same script see the old
+  columns.
 
 ### 4. ⬜ Invalid queries reported as `jobInternalError` — #316
 
