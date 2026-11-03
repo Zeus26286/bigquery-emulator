@@ -10,8 +10,7 @@ checked against a build of `main` at `cb8555b` on 2026-10-30. "Reproduced"
 means the bug was confirmed against that build. Every issue and PR number
 links to goccy/bigquery-emulator, not to this fork.
 
-**Status legend:** ✅ fixed on a branch of this fork, not merged into `main`
-yet (see the item) · ⬜ open
+**Status legend:** ✅ fixed and merged into `main` of this fork (see the item) · ⬜ open
 
 | # | Status | Problem | Evidence | Issues / PRs |
 | --- | --- | --- | --- | --- |
@@ -33,8 +32,8 @@ yet (see the item) · ⬜ open
 With `ds1.t` and `ds2.t` both present, listing `ds2.t` returned `ds1.t`'s rows.
 Silently wrong data.
 
-**Fixed on branch [`fix/issue-532-tabledata-list-dataset`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-532-tabledata-list-dataset) (410ba58), in
-[Zeus26286/bigquery-emulator#3](https://github.com/Zeus26286/bigquery-emulator/pull/3).** Reads
+**Fixed in
+[Zeus26286/bigquery-emulator#3](https://github.com/Zeus26286/bigquery-emulator/pull/3), merged into `main` as e02d561.** Reads
 looked tables up by bare name, which the engine resolved to the first dataset
 holding that name. The same bug also affected **extract jobs** and the
 **Storage Read API**; all three now use the full `project.dataset.table` path.
@@ -46,8 +45,8 @@ Regression tests: `TestIssue532SameTableNameInTwoDatasets`,
 Inserting `AAECAw…` stored and returned `QUFFQ0F3…`. Silent corruption of every
 BYTES value written through `insertAll`.
 
-**Fixed on branch [`fix/issue-498-bytes-double-base64`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-498-bytes-double-base64) (8d35ac4), in
-[Zeus26286/bigquery-emulator#4](https://github.com/Zeus26286/bigquery-emulator/pull/4).** The base64
+**Fixed in
+[Zeus26286/bigquery-emulator#4](https://github.com/Zeus26286/bigquery-emulator/pull/4), merged into `main` as 97729fb.** The base64
 text was stored as the bytes themselves. It is now decoded for top-level and
 STRUCT-nested BYTES, which also fixes query results written to a destination
 table (they were encoded three times). `ARRAY<BYTES>` was already correct.
@@ -69,8 +68,8 @@ checked for the same bug.
 Everyday SQL in dbt and migrations; likely one root cause. Open PRs: [#519](https://github.com/goccy/bigquery-emulator/issues/519),
 [#495](https://github.com/goccy/bigquery-emulator/issues/495), [#522](https://github.com/goccy/bigquery-emulator/issues/522).
 
-**Fixed on branch [`fix/ddl-catalog-sync`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/ddl-catalog-sync), in
-[Zeus26286/bigquery-emulator#1](https://github.com/Zeus26286/bigquery-emulator/pull/1).**
+**Fixed in
+[Zeus26286/bigquery-emulator#1](https://github.com/Zeus26286/bigquery-emulator/pull/1), merged into `main` as 3ee8537.**
 Three catalogs drifted apart: SQLite, googlesqlite's in-memory analyzer
 catalog, and the emulator's metadata, which was synced only after a successful
 query. The sync is now idempotent and runs in one transaction. A re-added
