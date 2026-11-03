@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/base64"
 	"fmt"
 	"reflect"
 	"strings"
@@ -614,6 +615,15 @@ func normalizeData(v interface{}, field *bigqueryv2.TableFieldSchema) (interface
 			fields = append(fields, map[string]interface{}{f.Name: value})
 		}
 		return fields, nil
+	}
+	// The REST API carries BYTES as base64 text; store the decoded bytes, or
+	// the text itself becomes the value and reads back encoded twice.
+	if s, ok := v.(string); ok && Type(field.Type) == BYTES {
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 value for BYTES field %s: %w", field.Name, err)
+		}
+		return b, nil
 	}
 	return v, nil
 }

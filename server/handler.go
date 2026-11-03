@@ -2882,13 +2882,27 @@ func (h *tabledataInsertAllHandler) Handle(ctx context.Context, r *tabledataInse
 		for k, v := range row.Json {
 			rowData[k] = v
 		}
-		data = append(data, rowData)
+		// A value that does not fit its column (e.g. BYTES that are not
+		// base64) is likewise rejected for its own row only.
+		rowTable, err := types.NewTableWithSchema(content, types.Data{rowData})
+		if err != nil {
+			insertErrors = append(insertErrors, &bigqueryv2.TableDataInsertAllResponseInsertErrors{
+				Index: int64(i),
+				Errors: []*bigqueryv2.ErrorProto{{
+					Reason:  "invalid",
+					Message: err.Error(),
+				}},
+			})
+			continue
+		}
+		data = append(data, rowTable.Data...)
 	}
 	if len(data) > 0 {
-		tableDef, err := types.NewTableWithSchema(content, data)
+		tableDef, err := types.NewTableWithSchema(content, nil)
 		if err != nil {
 			return nil, err
 		}
+		tableDef.Data = data
 		conn, err := r.server.connMgr.Connection(ctx, r.project.ID, r.dataset.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get connection: %w", err)

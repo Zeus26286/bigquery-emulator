@@ -4909,3 +4909,151 @@ func TestIssue532SameTableNameInTwoDatasets(t *testing.T) {
 		})
 	}
 }
+
+// TestIssue498BytesRoundTrip is a regression test for issue #498. The REST API
+// carries BYTES values as base64 text; the emulator stored that text itself
+// as the bytes, so every BYTES value came back base64-encoded twice.
+func TestIssue498BytesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bqServer.Load(server.StructSource(types.NewProject("test", types.NewDataset("ds498")))); err != nil {
+		t.Fatal(err)
+	}
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Stop(ctx)
+	}()
+
+	client, err := bigquery.NewClient(ctx, "test",
+		option.WithEndpoint(testServer.URL), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	type Nested struct {
+		B []byte
+	}
+	type Row struct {
+		B      []byte
+		Arr    [][]byte
+		S      Nested
+		ArrOfS []Nested
+	}
+	want := Row{
+		B:      []byte{0, 1, 2, 3, 4, 5, 6, 7},
+		Arr:    [][]byte{{0xff}, []byte("hello")},
+		S:      Nested{B: []byte{0xde, 0xad, 0xbe, 0xef}},
+		ArrOfS: []Nested{{B: []byte{0x01}}, {B: []byte{0x02, 0x03}}},
+	}
+
+	schema, err := bigquery.InferSchema(Row{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := client.Dataset("ds498").Table("bytes_tbl")
+	if err := table.Create(ctx, &bigquery.TableMetadata{Schema: schema}); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Inserter().Put(ctx, &want); err != nil {
+		t.Fatal(err)
+	}
+
+	readOne := func(t *testing.T, it *bigquery.RowIterator) Row {
+		t.Helper()
+		var got Row
+		if err := it.Next(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	t.Run("tabledata.list", func(t *testing.T) {
+		if diff := cmp.Diff(want, readOne(t, table.Read(ctx))); diff != "" {
+			t.Fatalf("(-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("query", func(t *testing.T) {
+		it, err := client.Query("SELECT B, Arr, S, ArrOfS FROM ds498.bytes_tbl").Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(want, readOne(t, it)); diff != "" {
+			t.Fatalf("(-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("stored bytes", func(t *testing.T) {
+		it, err := client.Query("SELECT TO_HEX(B) AS H FROM ds498.bytes_tbl").Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct{ H string }
+		if err := it.Next(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.H != "0001020304050607" {
+			t.Fatalf("TO_HEX(B) = %q; want %q", got.H, "0001020304050607")
+		}
+	})
+
+	t.Run("query into destination table", func(t *testing.T) {
+		dest := client.Dataset("ds498").Table("bytes_dest")
+		q := client.Query("SELECT B, Arr, S, ArrOfS FROM ds498.bytes_tbl")
+		q.Dst = dest
+		job, err := q.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, err := job.Wait(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := status.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(want, readOne(t, dest.Read(ctx))); diff != "" {
+			t.Fatalf("(-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("invalid base64 rejects only its row", func(t *testing.T) {
+		body := `{"rows":[{"json":{"B":"not base64!"}},{"json":{"B":"/w=="}}]}`
+		res, err := http.Post(
+			testServer.URL+"/projects/test/datasets/ds498/tables/bytes_tbl/insertAll",
+			"application/json",
+			strings.NewReader(body),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d; want 200", res.StatusCode)
+		}
+		var got bigqueryv2.TableDataInsertAllResponse
+		if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.InsertErrors) != 1 || got.InsertErrors[0].Index != 0 ||
+			got.InsertErrors[0].Errors[0].Reason != "invalid" {
+			t.Fatalf("insertErrors = %+v; want one invalid error for row 0", got.InsertErrors)
+		}
+		it, err := client.Query("SELECT COUNT(*) AS n FROM ds498.bytes_tbl WHERE B = b'\\xff'").Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count struct{ N int64 }
+		if err := it.Next(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count.N != 1 {
+			t.Fatalf("valid row inserted %d times; want 1", count.N)
+		}
+	})
+}
