@@ -33,7 +33,8 @@ yet (see the item) · ⬜ open
 With `ds1.t` and `ds2.t` both present, listing `ds2.t` returned `ds1.t`'s rows.
 Silently wrong data.
 
-**Fixed on branch [`fix/issue-532-tabledata-list-dataset`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-532-tabledata-list-dataset) (410ba58).** Reads
+**Fixed on branch [`fix/issue-532-tabledata-list-dataset`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-532-tabledata-list-dataset) (410ba58), in
+[Zeus26286/bigquery-emulator#3](https://github.com/Zeus26286/bigquery-emulator/pull/3).** Reads
 looked tables up by bare name, which the engine resolved to the first dataset
 holding that name. The same bug also affected **extract jobs** and the
 **Storage Read API**; all three now use the full `project.dataset.table` path.
@@ -45,7 +46,8 @@ Regression tests: `TestIssue532SameTableNameInTwoDatasets`,
 Inserting `AAECAw…` stored and returned `QUFFQ0F3…`. Silent corruption of every
 BYTES value written through `insertAll`.
 
-**Fixed on branch [`fix/issue-498-bytes-double-base64`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-498-bytes-double-base64) (8d35ac4).** The base64
+**Fixed on branch [`fix/issue-498-bytes-double-base64`](https://github.com/Zeus26286/bigquery-emulator/tree/fix/issue-498-bytes-double-base64) (8d35ac4), in
+[Zeus26286/bigquery-emulator#4](https://github.com/Zeus26286/bigquery-emulator/pull/4).** The base64
 text was stored as the bytes themselves. It is now decoded for top-level and
 STRUCT-nested BYTES, which also fixes query results written to a destination
 table (they were encoded three times). `ARRAY<BYTES>` was already correct.
