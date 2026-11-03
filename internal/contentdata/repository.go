@@ -125,7 +125,11 @@ func (r *Repository) CreateTable(ctx context.Context, tx *connection.Tx, table *
 // It repairs the spec after a CREATE TABLE IF NOT EXISTS hit an existing
 // table: googlesqlite records the statement's columns as the table's spec
 // even though nothing was created, and its analyzer adopts them on the next
-// catalog rebuild. Once googlesqlite stops doing that, this can be removed.
+// catalog rebuild.
+//
+// TODO(googlesqlite): CREATE TABLE IF NOT EXISTS on an existing table must
+// not replace the stored table spec (no upstream issue yet). Remove this
+// once googlesqlite leaves the spec alone.
 func (r *Repository) RestoreTableSpec(ctx context.Context, tx *connection.Tx, table *bigqueryv2.Table) error {
 	if err := tx.ContentRepoMode(); err != nil {
 		return err
@@ -174,8 +178,12 @@ func (r *Repository) createTableSQL(table *bigqueryv2.Table, ifNotExists bool) (
 // later queries are analyzed against the old columns. Any catalog reset
 // rebuilds every handle from the current specs. Dropping a temp function
 // triggers one, and a temp function is dropped when the rows of the query
-// that declared it are closed. Once googlesqlite rebuilds the handle on
-// replace, this can be removed.
+// that declared it are closed.
+//
+// TODO(googlesqlite): Catalog.addTableSpec must rebuild the analyzer's table
+// handle when it replaces an existing table (no upstream issue yet). Remove
+// this once it does; it also makes a CREATE OR REPLACE visible to later
+// statements of the same script.
 func (r *Repository) RefreshCatalog(ctx context.Context, tx *connection.Tx) error {
 	if err := tx.ContentRepoMode(); err != nil {
 		return err
@@ -198,6 +206,25 @@ func (r *Repository) RefreshCatalog(ctx context.Context, tx *connection.Tx) erro
 		return fmt.Errorf("failed to refresh catalog: %w", err)
 	}
 	return nil
+}
+
+// TableColumnNames returns the columns of a table as googlesqlite resolves
+// them inside tx, in order. It reads a row, so that in a transaction it also
+// takes the table's read lock.
+func (r *Repository) TableColumnNames(ctx context.Context, tx *connection.Tx, ref *bigqueryv2.TableReference) ([]string, error) {
+	tablePath, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+	if err != nil {
+		return nil, err
+	}
+	response, err := r.Query(ctx, tx, ref.ProjectId, ref.DatasetId, fmt.Sprintf("SELECT * FROM `%s` LIMIT 1", tablePath), nil)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(response.Schema.Fields))
+	for _, field := range response.Schema.Fields {
+		names = append(names, field.Name)
+	}
+	return names, nil
 }
 
 // ProjectedColumn is one column of the table built by RebuildTableSQL.

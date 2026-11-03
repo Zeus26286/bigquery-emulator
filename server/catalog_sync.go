@@ -43,7 +43,8 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		var filtered []*googlesqlite.TableSpec
 		for _, spec := range specs {
 			// Temp tables live only for the script that created them and
-			// belong to no dataset.
+			// belong to no dataset. Their cleanup is googlesqlite's job
+			// (see goccy/googlesqlite#92 and goccy/googlesqlite#96).
 			if spec.IsTemp {
 				continue
 			}

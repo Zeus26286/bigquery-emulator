@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goccy/go-googlesql"
@@ -11,6 +13,7 @@ import (
 	"github.com/goccy/googlesqlite"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
 
+	"github.com/goccy/bigquery-emulator/internal/connection"
 	"github.com/goccy/bigquery-emulator/internal/contentdata"
 	"github.com/goccy/bigquery-emulator/internal/metadata"
 	"github.com/goccy/bigquery-emulator/types"
@@ -25,8 +28,13 @@ import (
 //
 // ALTER TABLE inside a multi-statement script and any other action are left
 // to googlesqlite. ALTER TABLE statements are serialized (Server.alterMu)
-// because the plan is built from the metadata before the rebuild runs. Once
-// googlesqlite implements ALTER TABLE, this file can be removed.
+// because the plan is built from the metadata before the rebuild runs, and
+// checkUnchanged guards the rebuild against any other concurrent change.
+//
+// TODO(googlesqlite): implement ALTER TABLE ADD/DROP/RENAME COLUMN and
+// RENAME TO, and report it through ChangedCatalog.Table.Updated (no upstream
+// issue yet; googlesqlite runs ALTER TABLE as a no-op). Once it does, this
+// file can be removed.
 
 // alterTablePlan is a standalone ALTER TABLE statement rewritten into a
 // table rebuild.
@@ -34,6 +42,11 @@ type alterTablePlan struct {
 	ref *bigqueryv2.TableReference
 	// newRef is the new name of the table for RENAME TO, and nil otherwise.
 	newRef *bigqueryv2.TableReference
+	// tmpRef is the table the rows go through for a column change.
+	tmpRef *bigqueryv2.TableReference
+	// sourceColumns are the columns of the table when the plan was made.
+	// The rebuild runs only if the table still has them (checkUnchanged).
+	sourceColumns []string
 	// columns is the final column list for a column change.
 	columns []*alterColumn
 	// sql is the rewritten script. An empty sql means that there is
@@ -115,12 +128,70 @@ type parsedAlterTable struct {
 
 // skips reports whether syncCatalog must leave a table to applyMetadata.
 func (p *alterTablePlan) skips(projectID, datasetID, tableID string) bool {
-	for _, ref := range []*bigqueryv2.TableReference{p.ref, p.newRef} {
+	for _, ref := range []*bigqueryv2.TableReference{p.ref, p.newRef, p.tmpRef} {
 		if ref != nil && ref.ProjectId == projectID && ref.DatasetId == datasetID && ref.TableId == tableID {
 			return true
 		}
 	}
 	return false
+}
+
+// alterTmpTablePrefix starts the name of the table a column change copies
+// the rows through.
+const alterTmpTablePrefix = "__bqemu_alter_"
+
+// alterBeforeRebuildHook, when set by a test, runs between planning an
+// ALTER TABLE and starting the job transaction that rebuilds the table.
+var alterBeforeRebuildHook struct {
+	mu sync.Mutex
+	fn func(plan *alterTablePlan)
+}
+
+func runAlterBeforeRebuildHook(plan *alterTablePlan) {
+	if plan == nil {
+		return
+	}
+	alterBeforeRebuildHook.mu.Lock()
+	hook := alterBeforeRebuildHook.fn
+	alterBeforeRebuildHook.mu.Unlock()
+	if hook != nil {
+		hook(plan)
+	}
+}
+
+func setAlterBeforeRebuildHook(fn func(plan *alterTablePlan)) {
+	alterBeforeRebuildHook.mu.Lock()
+	defer alterBeforeRebuildHook.mu.Unlock()
+	alterBeforeRebuildHook.fn = fn
+}
+
+// errAlterConcurrentModification is returned when the table changed between
+// planning an ALTER TABLE and running its rebuild.
+var errAlterConcurrentModification = errors.New("was modified concurrently while ALTER TABLE was running; retry the statement")
+
+// checkUnchanged verifies, inside the job transaction, that the table still
+// has the columns the plan was made from. alterMu serializes ALTER TABLE
+// statements, but any other DDL or API call (CREATE OR REPLACE, DROP,
+// tables.update, ...) can change the table between planning and the
+// rebuild. Reading the table here also holds the read lock that keeps such
+// changes out until the rebuild commits.
+func (p *alterTablePlan) checkUnchanged(ctx context.Context, server *Server, tx *connection.Tx) error {
+	if p.sql == "" {
+		return nil
+	}
+	tableName := fmt.Sprintf("%s:%s.%s", p.ref.ProjectId, p.ref.DatasetId, p.ref.TableId)
+	columns, err := server.contentRepo.TableColumnNames(ctx, tx, p.ref)
+	if err != nil {
+		return fmt.Errorf("table %s %w: %s", tableName, errAlterConcurrentModification, err)
+	}
+	same := len(columns) == len(p.sourceColumns)
+	for i := 0; same && i < len(columns); i++ {
+		same = strings.EqualFold(columns[i], p.sourceColumns[i])
+	}
+	if !same {
+		return fmt.Errorf("table %s %w: planned for columns %v, found %v", tableName, errAlterConcurrentModification, p.sourceColumns, columns)
+	}
+	return nil
 }
 
 // planAlterTable returns (nil, nil) when query is not a standalone ALTER TABLE
@@ -186,6 +257,9 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 	}
 
 	plan := &alterTablePlan{ref: ref}
+	for _, field := range content.Schema.Fields {
+		plan.sourceColumns = append(plan.sourceColumns, field.Name)
+	}
 	if stmt.actions[0].kind == alterRenameTo {
 		if len(stmt.actions) != 1 {
 			return nil, fmt.Errorf("ALTER TABLE RENAME TO cannot be combined with other actions")
@@ -307,11 +381,14 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 	for _, column := range columns {
 		projection = append(projection, contentdata.ProjectedColumn{Expr: column.expr, Name: column.name})
 	}
-	tmpTableID := fmt.Sprintf("__bqemu_alter_%s_%s", ref.TableId, randomID())
+	// A short fixed prefix and a random suffix keep the name bounded
+	// whatever the length of the table name.
+	tmpTableID := alterTmpTablePrefix + randomID()
 	sql, err := server.contentRepo.RebuildTableSQL(ref, ref, tmpTableID, projection)
 	if err != nil {
 		return nil, err
 	}
+	plan.tmpRef = &bigqueryv2.TableReference{ProjectId: ref.ProjectId, DatasetId: ref.DatasetId, TableId: tmpTableID}
 	plan.columns = columns
 	plan.sql = sql
 	return plan, nil
@@ -502,9 +579,37 @@ func quoteIdent(name string) string {
 	return "`" + name + "`"
 }
 
-// looksLikeAlter reports whether query starts with ALTER, after any
-// leading whitespace and comments.
+// looksLikeAlter reports whether query starts with ALTER TABLE, after any
+// leading whitespace and comments. The keywords are matched
+// case-insensitively and may be separated by any whitespace.
 func looksLikeAlter(query string) bool {
+	rest := skipSpaceAndComments(query)
+	if !hasKeywordPrefix(rest, "ALTER") {
+		return false
+	}
+	rest = rest[len("ALTER"):]
+	if trimmed := strings.TrimLeft(rest, " \t\r\n\f"); len(trimmed) != len(rest) {
+		return hasKeywordPrefix(trimmed, "TABLE")
+	}
+	return false
+}
+
+// hasKeywordPrefix reports whether s starts with keyword, case-insensitively,
+// not followed by another identifier character.
+func hasKeywordPrefix(s, keyword string) bool {
+	if len(s) < len(keyword) || !strings.EqualFold(s[:len(keyword)], keyword) {
+		return false
+	}
+	if len(s) == len(keyword) {
+		return true
+	}
+	c := s[len(keyword)]
+	return !(c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z')
+}
+
+// skipSpaceAndComments returns query without its leading whitespace and
+// comments.
+func skipSpaceAndComments(query string) string {
 	rest := query
 	for {
 		rest = strings.TrimLeft(rest, " \t\r\n\f")
@@ -512,17 +617,17 @@ func looksLikeAlter(query string) bool {
 		case strings.HasPrefix(rest, "--"), strings.HasPrefix(rest, "#"):
 			i := strings.IndexByte(rest, '\n')
 			if i < 0 {
-				return false
+				return ""
 			}
 			rest = rest[i+1:]
 		case strings.HasPrefix(rest, "/*"):
 			i := strings.Index(rest[2:], "*/")
 			if i < 0 {
-				return false
+				return ""
 			}
 			rest = rest[2+i+2:]
 		default:
-			return len(rest) >= len("ALTER") && strings.EqualFold(rest[:len("ALTER")], "ALTER")
+			return rest
 		}
 	}
 }

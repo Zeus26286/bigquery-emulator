@@ -1753,6 +1753,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		// Plan before the job transaction starts: planning reads the
 		// metadata through another connection.
 		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+		runAlterBeforeRebuildHook(alterPlan)
 	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
@@ -1773,10 +1774,19 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		jobErr = planErr
 	case alterPlan != nil && alterPlan.sql == "":
 		response = emptyDDLResponse()
-	default:
-		if alterPlan != nil {
-			queryText = alterPlan.sql
+	case alterPlan != nil:
+		if jobErr = alterPlan.checkUnchanged(ctx, r.server, tx); jobErr != nil {
+			break
 		}
+		response, jobErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			alterPlan.sql,
+			job.Configuration.Query.QueryParameters,
+		)
+	default:
 		// On error, response may carry the catalog changes of the
 		// statements that ran before the failure.
 		response, jobErr = r.server.contentRepo.Query(
@@ -1916,7 +1926,8 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	if !job.Configuration.DryRun {
 		// The statements of a failed script that ran before the failure
 		// are committed too, as in BigQuery, so their catalog changes are
-		// synced as well.
+		// synced as well. Rolling back would leave googlesqlite's in-memory
+		// catalog ahead of the tables (goccy/googlesqlite#104).
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
@@ -2111,7 +2122,10 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	queryProjectID, datasetID := queryProjectAndDataset(r.queryRequest.DefaultDataset, r.project.ID)
 	startTime := time.Now()
 	queryText := r.queryRequest.Query
-	var alterPlan *alterTablePlan
+	var (
+		alterPlan *alterTablePlan
+		planErr   error
+	)
 	if !r.queryRequest.DryRun && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
 		// ALTER TABLE statements must not interleave.
@@ -2119,11 +2133,8 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		defer r.server.alterMu.Unlock()
 		// Plan before the transaction starts: planning reads the metadata
 		// through another connection.
-		plan, err := planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
-		if err != nil {
-			return nil, err
-		}
-		alterPlan = plan
+		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+		runAlterBeforeRebuildHook(alterPlan)
 	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
@@ -2138,12 +2149,26 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		response *internaltypes.QueryResponse
 		queryErr error
 	)
-	if alterPlan != nil && alterPlan.sql == "" {
+	switch {
+	case planErr != nil:
+		// An ALTER TABLE rejected while planning is reported like any
+		// other failed query on this endpoint.
+		queryErr = planErr
+	case alterPlan != nil && alterPlan.sql == "":
 		response = emptyDDLResponse()
-	} else {
-		if alterPlan != nil {
-			queryText = alterPlan.sql
+	case alterPlan != nil:
+		if queryErr = alterPlan.checkUnchanged(ctx, r.server, tx); queryErr != nil {
+			break
 		}
+		response, queryErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			alterPlan.sql,
+			r.queryRequest.QueryParameters,
+		)
+	default:
 		response, queryErr = r.server.contentRepo.Query(
 			ctx,
 			tx,
@@ -2156,9 +2181,10 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	if queryErr != nil {
 		// Keep what the statements before the failure did, as jobs.insert
 		// and BigQuery do. Rolling back would also leave googlesqlite's
-		// in-memory catalog ahead of the tables. A failed ALTER TABLE
-		// rebuild is rolled back instead, since ALTER TABLE is atomic.
-		if !r.queryRequest.DryRun && (alterPlan == nil || alterPlan.sql == "") {
+		// in-memory catalog ahead of the tables (goccy/googlesqlite#104).
+		// A failed ALTER TABLE is rolled back instead, since ALTER TABLE
+		// is atomic; a rejected plan has nothing to roll back.
+		if !r.queryRequest.DryRun && alterPlan == nil && planErr == nil {
 			if err := tx.Commit(); err != nil {
 				logger.Logger(ctx).Error("failed to commit a failed query", zap.Error(err))
 			} else {

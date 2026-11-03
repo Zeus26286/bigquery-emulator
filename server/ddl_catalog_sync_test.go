@@ -634,6 +634,112 @@ func TestAlterTableEdgeCases(t *testing.T) {
 	})
 }
 
+// TestJobsQuerySingleFailingStatementIsAtomic checks that committing a
+// failed query on jobs.query keeps only the statements before the failure:
+// a single statement that fails part way through its rows changes nothing.
+func TestJobsQuerySingleFailingStatementIsAtomic(t *testing.T) {
+	for _, mode := range ddlModes {
+		t.Run(mode, func(t *testing.T) {
+			env := newDDLTestEnv(t)
+			env.mustExec(t, mode, "CREATE TABLE dataset1.atomic (a INT64)")
+			env.mustExec(t, mode, "INSERT INTO dataset1.atomic (a) VALUES (1), (2), (3)")
+			want := [][]bigquery.Value{{int64(1)}, {int64(2)}, {int64(3)}}
+			for _, sql := range []string{
+				"INSERT INTO dataset1.atomic (a) SELECT IF(x = 3, ERROR('boom'), x + 100) FROM UNNEST([1, 2, 3]) AS x",
+				"UPDATE dataset1.atomic SET a = IF(a = 3, ERROR('boom'), a + 10) WHERE TRUE",
+				"DELETE FROM dataset1.atomic WHERE IF(a = 3, ERROR('boom'), TRUE)",
+			} {
+				assertErrContains(t, env.exec(t, mode, sql), "boom")
+				if rows := env.mustRead(t, "SELECT a FROM dataset1.atomic ORDER BY a"); !reflect.DeepEqual(rows, want) {
+					t.Fatalf("after %s: got %v, want %v", sql, rows, want)
+				}
+			}
+		})
+	}
+}
+
+// postQuery runs sql through jobs.query over raw REST and returns the HTTP
+// status and the error reason, if any.
+func (e *ddlTestEnv) postQuery(t *testing.T, sql string) (int, string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"query":%q,"useLegacySql":false}`, sql)
+	resp, err := http.Post(e.url+"/bigquery/v2/projects/test/queries", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res struct {
+		Error *struct {
+			Errors []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(b, &res); err != nil {
+		t.Fatalf("decode %s: %v", b, err)
+	}
+	if res.Error == nil || len(res.Error.Errors) == 0 {
+		return resp.StatusCode, ""
+	}
+	return resp.StatusCode, res.Error.Errors[0].Reason
+}
+
+func (e *ddlTestEnv) jobCount(t *testing.T) int {
+	t.Helper()
+	n := 0
+	it := e.client.Jobs(e.ctx)
+	for {
+		_, err := it.Next()
+		if err == iterator.Done {
+			return n
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+}
+
+// TestAlterPlanErrorsLikeQueryErrors checks that an ALTER TABLE rejected by
+// the emulator is reported like any other invalid query, on both endpoints.
+func TestAlterPlanErrorsLikeQueryErrors(t *testing.T) {
+	env := newDDLTestEnv(t)
+	env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.perr (a INT64)")
+	invalid := "SELEC 1"
+	for n, rejected := range []string{
+		"ALTER TABLE dataset1.nope ADD COLUMN b STRING",
+		"ALTER TABLE dataset1.perr ADD COLUMN a STRING",
+		"ALTER TABLE dataset1.perr ADD COLUMN c STRING DEFAULT 'x'",
+	} {
+		t.Run(rejected, func(t *testing.T) {
+			// jobs.insert: a failed job is recorded for both.
+			for i, sql := range []string{invalid, rejected} {
+				code, msg := env.postJob(t, fmt.Sprintf("perr_%d_%d", n, i), sql)
+				if code != http.StatusOK || msg == "" {
+					t.Fatalf("jobs.insert %q: got HTTP %d %q, want 200 with an errorResult", sql, code, msg)
+				}
+			}
+			// jobs.query: the same HTTP error, and the same effect on the
+			// job list.
+			before := env.jobCount(t)
+			invalidCode, invalidReason := env.postQuery(t, invalid)
+			afterInvalid := env.jobCount(t)
+			rejectedCode, rejectedReason := env.postQuery(t, rejected)
+			afterRejected := env.jobCount(t)
+			if invalidCode == http.StatusOK || invalidCode != rejectedCode || invalidReason != rejectedReason {
+				t.Fatalf("jobs.query: %q got HTTP %d %q, %q got HTTP %d %q", invalid, invalidCode, invalidReason, rejected, rejectedCode, rejectedReason)
+			}
+			if afterInvalid-before != afterRejected-afterInvalid {
+				t.Fatalf("jobs.query registered %d job(s) for %q and %d for %q", afterInvalid-before, invalid, afterRejected-afterInvalid, rejected)
+			}
+		})
+	}
+}
+
 func TestFailedScriptSyncsCatalog(t *testing.T) {
 	for _, mode := range ddlModes {
 		t.Run("create_then_error/"+mode, func(t *testing.T) {
