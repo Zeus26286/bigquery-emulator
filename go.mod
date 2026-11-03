@@ -9,6 +9,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/fsouza/fake-gcs-server v1.54.0
 	github.com/go-playground/validator/v10 v10.30.2
+	github.com/goccy/go-googlesql v0.3.0
 	github.com/goccy/go-json v0.10.6
 	github.com/goccy/go-yaml v1.19.2
 	github.com/goccy/googlesqlite v0.3.1
@@ -73,7 +74,6 @@ require (
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
-	github.com/goccy/go-googlesql v0.3.0 // indirect
 	github.com/goccy/googlesqlwasm2go v0.1.0 // indirect
 	github.com/golang/geo v0.0.0-20260512202753-e3c51de6d1b6 // indirect
 	github.com/golang/snappy v1.0.0 // indirect

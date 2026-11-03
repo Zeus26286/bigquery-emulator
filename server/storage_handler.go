@@ -184,7 +184,7 @@ func (s *storageReadServer) SplitReadStream(ctx context.Context, req *storagepb.
 	return nil, fmt.Errorf("unimplemented split read stream")
 }
 
-func (s *storageReadServer) buildQuery(status *readStreamStatus) string {
+func (s *storageReadServer) buildQuery(status *readStreamStatus) (string, error) {
 	var columns string
 	if len(status.outputColumns) != 0 {
 		outputColumns := make([]string, len(status.outputColumns))
@@ -199,7 +199,11 @@ func (s *storageReadServer) buildQuery(status *readStreamStatus) string {
 	if status.condition != "" {
 		condition = fmt.Sprintf("WHERE %s", status.condition)
 	}
-	return fmt.Sprintf("SELECT %s FROM `%s` %s", columns, status.tableID, condition)
+	tablePath, err := s.server.contentRepo.TablePath(status.projectID, status.datasetID, status.tableID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SELECT %s FROM `%s` %s", columns, tablePath, condition), nil
 }
 
 func (s *storageReadServer) query(ctx context.Context, status *readStreamStatus) (*internaltypes.QueryResponse, error) {
@@ -213,7 +217,10 @@ func (s *storageReadServer) query(ctx context.Context, status *readStreamStatus)
 	}
 	defer tx.RollbackIfNotCommitted()
 
-	query := s.buildQuery(status)
+	query, err := s.buildQuery(status)
+	if err != nil {
+		return nil, err
+	}
 	return s.server.contentRepo.Query(
 		ctx,
 		tx,

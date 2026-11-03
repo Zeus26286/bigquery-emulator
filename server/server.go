@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -33,6 +34,9 @@ type Server struct {
 	httpServer     *http.Server
 	grpcServer     *grpc.Server
 	listenCallback func(httpAddr, grpcAddr string)
+	// alterMu serializes the ALTER TABLE statements the emulator rewrites
+	// (see alter_table.go).
+	alterMu sync.Mutex
 }
 
 // SetListenCallback registers a function invoked once the HTTP and gRPC

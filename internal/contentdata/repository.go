@@ -79,6 +79,14 @@ func (r *Repository) tablePath(projectID, datasetID, tableID string) (string, er
 	return strings.Join(tablePath, "."), nil
 }
 
+// TablePath returns the fully-qualified path of a table for embedding between
+// backticks. Always address a table through it: a bare table ID is resolved
+// by name across datasets and can hit another dataset's table of the same
+// name.
+func (r *Repository) TablePath(projectID, datasetID, tableID string) (string, error) {
+	return r.tablePath(projectID, datasetID, tableID)
+}
+
 func (r *Repository) routinePath(projectID, datasetID, routineID string) (string, error) {
 	var routinePath []string
 	if projectID != "" {
@@ -107,26 +115,172 @@ func (r *Repository) CreateTable(ctx context.Context, tx *connection.Tx, table *
 	defer func() {
 		_ = tx.MetadataRepoMode()
 	}()
+	query, err := r.createTableSQL(table, false)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Tx().ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to create table %s: %w", query, err)
+	}
+	return nil
+}
+
+// RestoreTableSpec re-registers table's schema with googlesqlite by running
+// CREATE TABLE IF NOT EXISTS for a table that already exists. SQLite leaves
+// the table alone, but googlesqlite replaces its stored table spec with the
+// given columns.
+//
+// It repairs the spec after a CREATE TABLE IF NOT EXISTS hit an existing
+// table: googlesqlite records the statement's columns as the table's spec
+// even though nothing was created, and its analyzer adopts them on the next
+// catalog rebuild.
+//
+// TODO(googlesqlite): CREATE TABLE IF NOT EXISTS on an existing table must
+// not replace the stored table spec (no upstream issue yet). Remove this
+// once googlesqlite leaves the spec alone.
+func (r *Repository) RestoreTableSpec(ctx context.Context, tx *connection.Tx, table *bigqueryv2.Table) error {
+	if err := tx.ContentRepoMode(); err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.MetadataRepoMode()
+	}()
+	query, err := r.createTableSQL(table, true)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Tx().ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to restore table spec %s: %w", query, err)
+	}
+	return nil
+}
+
+func (r *Repository) createTableSQL(table *bigqueryv2.Table, ifNotExists bool) (string, error) {
 	ref := table.TableReference
 	if ref == nil {
-		return fmt.Errorf("TableReference is nil")
+		return "", fmt.Errorf("TableReference is nil")
 	}
 	fields := make([]string, 0, len(table.Schema.Fields))
 	for _, field := range table.Schema.Fields {
 		if err := validateIdent("column", field.Name); err != nil {
-			return err
+			return "", err
 		}
 		fields = append(fields, fmt.Sprintf("`%s` %s", escapeIdent(field.Name), r.encodeSchemaField(field)))
 	}
 	tablePath, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
 	if err != nil {
+		return "", err
+	}
+	stmt := "CREATE TABLE"
+	if ifNotExists {
+		stmt = "CREATE TABLE IF NOT EXISTS"
+	}
+	return fmt.Sprintf("%s `%s` (%s)", stmt, tablePath, strings.Join(fields, ",")), nil
+}
+
+// RefreshCatalog makes googlesqlite rebuild its analyzer catalog from the
+// stored table specs.
+//
+// googlesqlite's Catalog.addTableSpec only swaps the spec when a table is
+// replaced (CREATE OR REPLACE) and keeps the analyzer's old table handle, so
+// later queries are analyzed against the old columns. Any catalog reset
+// rebuilds every handle from the current specs. Dropping a temp function
+// triggers one, and a temp function is dropped when the rows of the query
+// that declared it are closed.
+//
+// TODO(googlesqlite): Catalog.addTableSpec must rebuild the analyzer's table
+// handle when it replaces an existing table (no upstream issue yet). Remove
+// this once it does; it also makes a CREATE OR REPLACE visible to later
+// statements of the same script.
+func (r *Repository) RefreshCatalog(ctx context.Context, tx *connection.Tx) error {
+	if err := tx.ContentRepoMode(); err != nil {
 		return err
 	}
-	query := fmt.Sprintf("CREATE TABLE `%s` (%s)", tablePath, strings.Join(fields, ","))
-	if _, err := tx.Tx().ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to create table %s: %w", query, err)
+	defer func() {
+		_ = tx.MetadataRepoMode()
+	}()
+	const query = "CREATE TEMP FUNCTION __bqemu_refresh_catalog() AS (1); SELECT 1"
+	rows, err := tx.Tx().QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to refresh catalog: %w", err)
+	}
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to refresh catalog: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to refresh catalog: %w", err)
 	}
 	return nil
+}
+
+// TableColumnNames returns the columns of a table as googlesqlite resolves
+// them inside tx, in order. It reads a row, so that in a transaction it also
+// takes the table's read lock.
+func (r *Repository) TableColumnNames(ctx context.Context, tx *connection.Tx, ref *bigqueryv2.TableReference) ([]string, error) {
+	tablePath, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+	if err != nil {
+		return nil, err
+	}
+	response, err := r.Query(ctx, tx, ref.ProjectId, ref.DatasetId, fmt.Sprintf("SELECT * FROM `%s` LIMIT 1", tablePath), nil)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(response.Schema.Fields))
+	for _, field := range response.Schema.Fields {
+		names = append(names, field.Name)
+	}
+	return names, nil
+}
+
+// ProjectedColumn is one column of the table built by RebuildTableSQL.
+type ProjectedColumn struct {
+	// Expr is the raw SQL that computes the column from the source table,
+	// e.g. "`a`" or "CAST(NULL AS STRING)".
+	Expr string
+	Name string
+}
+
+// RebuildTableSQL returns a script that copies the rows of src into a new
+// table dst with the given columns, and drops src. When src and dst are the
+// same table, the rows go through the temporary table tmpTableID in the same
+// dataset. All paths are fully qualified.
+func (r *Repository) RebuildTableSQL(src, dst *bigqueryv2.TableReference, tmpTableID string, projection []ProjectedColumn) (string, error) {
+	if len(projection) == 0 {
+		return "", fmt.Errorf("a table needs at least one column")
+	}
+	columns := make([]string, 0, len(projection))
+	for _, column := range projection {
+		if err := validateIdent("column", column.Name); err != nil {
+			return "", err
+		}
+		columns = append(columns, fmt.Sprintf("%s AS `%s`", column.Expr, escapeIdent(column.Name)))
+	}
+	srcPath, err := r.tablePath(src.ProjectId, src.DatasetId, src.TableId)
+	if err != nil {
+		return "", err
+	}
+	dstPath, err := r.tablePath(dst.ProjectId, dst.DatasetId, dst.TableId)
+	if err != nil {
+		return "", err
+	}
+	selectList := strings.Join(columns, ", ")
+	if srcPath != dstPath {
+		return fmt.Sprintf(
+			"CREATE TABLE `%s` AS SELECT %s FROM `%s`; DROP TABLE `%s`",
+			dstPath, selectList, srcPath, srcPath,
+		), nil
+	}
+	tmpPath, err := r.tablePath(src.ProjectId, src.DatasetId, tmpTableID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(
+		"CREATE TABLE `%s` AS SELECT %s FROM `%s`; DROP TABLE `%s`; CREATE TABLE `%s` AS SELECT * FROM `%s`; DROP TABLE `%s`",
+		tmpPath, selectList, srcPath, srcPath, dstPath, tmpPath, tmpPath,
+	), nil
 }
 
 func (r *Repository) CreateView(ctx context.Context, tx *connection.Tx, table *bigqueryv2.Table) error {
@@ -179,6 +333,12 @@ func (r *Repository) encodeSchemaField(field *bigqueryv2.TableFieldSchema) strin
 	return elem
 }
 
+// Query runs query and returns its result.
+//
+// When the query fails after it started running, the error comes with a
+// non-nil response that carries only ChangedCatalog: the catalog changes of
+// the statements that ran before the failure. Callers that commit those
+// statements use it to keep the table metadata in sync.
 func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, datasetID, query string, params []*bigqueryv2.QueryParameter) (*internaltypes.QueryResponse, error) {
 	tx.SetProjectAndDataset(projectID, datasetID)
 	if err := tx.ContentRepoMode(); err != nil {
@@ -225,22 +385,23 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 	if err != nil {
 		return nil, fmt.Errorf("failed to get changed catalog: %w", err)
 	}
+	partial := &internaltypes.QueryResponse{ChangedCatalog: changedCatalog}
 	colNames, err := rows.Columns()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get columns: %w", err)
+		return partial, fmt.Errorf("failed to get columns: %w", err)
 	}
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get column types: %w", err)
+		return partial, fmt.Errorf("failed to get column types: %w", err)
 	}
 	tableRows := []*internaltypes.TableRow{}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get column types: %w", err)
+		return partial, fmt.Errorf("failed to get column types: %w", err)
 	}
 	for i := 0; i < len(columnTypes); i++ {
 		typ, err := googlesqlite.UnmarshalDatabaseTypeName(columnTypes[i].DatabaseTypeName())
 		if err != nil {
-			return nil, fmt.Errorf("failed to get type from database type name: %w", err)
+			return partial, fmt.Errorf("failed to get type from database type name: %w", err)
 		}
 		fields = append(fields, types.TableFieldSchemaFromColumnType(colNames[i], typ))
 	}
@@ -256,10 +417,10 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 			values = append(values, &v)
 		}
 		if err := rows.Scan(values...); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
+			return partial, fmt.Errorf("failed to scan row: %w", err)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("failed to execute query: %w", err)
+			return partial, fmt.Errorf("failed to execute query: %w", err)
 		}
 		cells := make([]*internaltypes.TableCell, 0, len(values))
 		resultValues := make([]interface{}, 0, len(values))
@@ -271,7 +432,7 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 			}
 			cell, err := r.convertValueToCell(v, fields[idx])
 			if err != nil {
-				return nil, fmt.Errorf("failed to convert value to cell: %w", err)
+				return partial, fmt.Errorf("failed to convert value to cell: %w", err)
 			}
 			cell.Name = colNames[idx]
 			cells = append(cells, cell)
@@ -284,7 +445,7 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to scan rows: %w", err)
+		return partial, fmt.Errorf("failed to scan rows: %w", err)
 	}
 	logger.Logger(ctx).Debug("query result", zap.Any("rows", result))
 	return &internaltypes.QueryResponse{

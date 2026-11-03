@@ -27,8 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ruby ruby-dev build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY clients/ruby/gems.txt /tmp/gems.txt
-RUN gem install --no-document --install-dir /deps/ruby \
-        $(awk -F: '{print $1, "-v", $2}' /tmp/gems.txt)
+# gems.txt installs json 2.x next to whatever json faraday pulls in;
+# runner.rb activates the 2.x one (see the comment there).
+RUN gem install --no-document --install-dir /deps/ruby $(cat /tmp/gems.txt)
 
 # ---------------------------------------------------------------------------
 # PHP client dependencies
