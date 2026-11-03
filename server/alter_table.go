@@ -167,7 +167,7 @@ func setAlterBeforeRebuildHook(fn func(plan *alterTablePlan)) {
 
 // errAlterConcurrentModification is returned when the table changed between
 // planning an ALTER TABLE and running its rebuild.
-var errAlterConcurrentModification = errors.New("was modified concurrently while ALTER TABLE was running; retry the statement")
+var errAlterConcurrentModification = errors.New("was modified concurrently while ALTER TABLE was running, or its columns no longer match its metadata; retry the statement, and recreate the table if it keeps failing")
 
 // checkUnchanged verifies, inside the job transaction, that the table still
 // has the columns the plan was made from. alterMu serializes ALTER TABLE
@@ -175,6 +175,11 @@ var errAlterConcurrentModification = errors.New("was modified concurrently while
 // tables.update, ...) can change the table between planning and the
 // rebuild. Reading the table here also holds the read lock that keeps such
 // changes out until the rebuild commits.
+//
+// Only column names and their order are compared: a change that keeps the
+// names but not the types (CREATE OR REPLACE ... AS SELECT 'x' AS a over an
+// INT64 a) is not detected. REST requests are serialized by
+// sequentialAccessMiddleware, so only callers outside it can cause one.
 func (p *alterTablePlan) checkUnchanged(ctx context.Context, server *Server, tx *connection.Tx) error {
 	if p.sql == "" {
 		return nil
