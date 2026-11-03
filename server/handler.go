@@ -1565,12 +1565,16 @@ func (h *jobsInsertHandler) exportToGCS(ctx context.Context, r *jobsInsertReques
 	defer tx.RollbackIfNotCommitted()
 	extract := r.job.Configuration.Extract
 	sourceTable := extract.SourceTable
+	tablePath, err := r.server.contentRepo.TablePath(sourceTable.ProjectId, sourceTable.DatasetId, sourceTable.TableId)
+	if err != nil {
+		return nil, err
+	}
 	response, err := r.server.contentRepo.Query(
 		ctx,
 		tx,
 		sourceTable.ProjectId,
 		sourceTable.DatasetId,
-		fmt.Sprintf("SELECT * FROM `%s`", sourceTable.TableId),
+		fmt.Sprintf("SELECT * FROM `%s`", tablePath),
 		nil,
 	)
 	if err != nil {
@@ -2942,12 +2946,16 @@ func (h *tabledataListHandler) Handle(ctx context.Context, r *tabledataListReque
 		return nil, fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer tx.RollbackIfNotCommitted()
+	tablePath, err := r.server.contentRepo.TablePath(r.project.ID, r.dataset.ID, r.table.ID)
+	if err != nil {
+		return nil, err
+	}
 	response, err := r.server.contentRepo.Query(
 		ctx,
 		tx,
 		r.project.ID,
 		r.dataset.ID,
-		fmt.Sprintf("SELECT * FROM `%s`", r.table.ID),
+		fmt.Sprintf("SELECT * FROM `%s`", tablePath),
 		nil,
 	)
 	if err != nil {

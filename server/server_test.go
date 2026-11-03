@@ -4797,3 +4797,115 @@ func TestExportDataStatement(t *testing.T) {
 		}
 	})
 }
+
+// TestIssue532SameTableNameInTwoDatasets is a regression test for issue #532.
+// Reads that address a table by its own ID used to query it by that bare ID
+// alone, which the engine resolved to the first dataset holding a table of
+// that name. With ds1.t and ds2.t both present, tabledata.list (and an
+// extract job) on ds2.t returned ds1.t's rows.
+func TestIssue532SameTableNameInTwoDatasets(t *testing.T) {
+	const (
+		projectID  = "test"
+		publicHost = "127.0.0.1"
+		bucketName = "test-issue532-bucket"
+	)
+
+	ctx := context.Background()
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTable := func(name string) *types.Table {
+		return types.NewTable(
+			"t",
+			[]*types.Column{types.NewColumn("name", types.STRING)},
+			types.Data{{"name": name}},
+		)
+	}
+	if err := bqServer.Load(server.StructSource(types.NewProject(
+		projectID,
+		types.NewDataset("ds1", newTable("from_ds1")),
+		types.NewDataset("ds2", newTable("from_ds2")),
+	))); err != nil {
+		t.Fatal(err)
+	}
+
+	testServer := bqServer.TestServer()
+	storageServer, err := fakestorage.NewServerWithOptions(fakestorage.Options{
+		PublicHost: publicHost,
+		Scheme:     "http",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(storageServer.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageEmulatorHost := fmt.Sprintf("http://%s:%s", publicHost, u.Port())
+	t.Setenv("STORAGE_EMULATOR_HOST", storageEmulatorHost)
+	defer func() {
+		testServer.Close()
+		bqServer.Stop(ctx)
+		storageServer.Stop()
+	}()
+
+	client, err := bigquery.NewClient(
+		ctx,
+		projectID,
+		option.WithEndpoint(testServer.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	for _, datasetID := range []string{"ds1", "ds2"} {
+		want := "from_" + datasetID
+
+		t.Run("tabledata.list "+datasetID, func(t *testing.T) {
+			it := client.Dataset(datasetID).Table("t").Read(ctx)
+			var got []string
+			for {
+				var row []bigquery.Value
+				if err := it.Next(&row); err != nil {
+					if err == iterator.Done {
+						break
+					}
+					t.Fatal(err)
+				}
+				got = append(got, row[0].(string))
+			}
+			if len(got) != 1 || got[0] != want {
+				t.Fatalf("tabledata.list %s.t = %v; want [%s]", datasetID, got, want)
+			}
+		})
+
+		t.Run("extract "+datasetID, func(t *testing.T) {
+			objectName := datasetID + ".csv"
+			gcsRef := bigquery.NewGCSReference(fmt.Sprintf("gs://%s/%s", bucketName, objectName))
+			gcsRef.DestinationFormat = bigquery.CSV
+			extractor := client.Dataset(datasetID).Table("t").ExtractorTo(gcsRef)
+			extractor.DisableHeader = true
+			job, err := extractor.Run(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, err := job.Wait(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := status.Err(); err != nil {
+				t.Fatal(err)
+			}
+			obj, err := storageServer.GetObject(bucketName, objectName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(string(obj.Content)); got != want {
+				t.Fatalf("extract %s.t = %q; want %q", datasetID, got, want)
+			}
+		})
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -892,5 +893,95 @@ func TestCreateReadSessionDefaultsToOneStream(t *testing.T) {
 	}
 	if got := len(session.GetStreams()); got != 1 {
 		t.Fatalf("session has %d streams; want 1 (unset MaxStreamCount must default to one)", got)
+	}
+}
+
+// TestIssue532StorageReadSameTableNameInTwoDatasets is the Storage Read API
+// counterpart of TestIssue532SameTableNameInTwoDatasets: a read session on
+// ds2.t must read ds2.t, not the first dataset's table of the same name.
+func TestIssue532StorageReadSameTableNameInTwoDatasets(t *testing.T) {
+	const project = "test"
+
+	ctx := context.Background()
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTable := func(name string) *types.Table {
+		return types.NewTable(
+			"t",
+			[]*types.Column{types.NewColumn("name", types.STRING)},
+			types.Data{{"name": name}},
+		)
+	}
+	if err := bqServer.Load(server.StructSource(types.NewProject(
+		project,
+		types.NewDataset("ds1", newTable("from_ds1")),
+		types.NewDataset("ds2", newTable("from_ds2")),
+	))); err != nil {
+		t.Fatal(err)
+	}
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Close()
+	}()
+	opts, err := testServer.GRPCClientOptions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bqReadClient, err := bqStorage.NewBigQueryReadClient(ctx, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bqReadClient.Close()
+
+	for _, dataset := range []string{"ds1", "ds2"} {
+		t.Run(dataset, func(t *testing.T) {
+			session, err := bqReadClient.CreateReadSession(ctx, &storagepb.CreateReadSessionRequest{
+				Parent: fmt.Sprintf("projects/%s", project),
+				ReadSession: &storagepb.ReadSession{
+					Table:      fmt.Sprintf("projects/%s/datasets/%s/tables/t", project, dataset),
+					DataFormat: storagepb.DataFormat_AVRO,
+				},
+				MaxStreamCount: 1,
+			}, rpcOpts)
+			if err != nil {
+				t.Fatalf("CreateReadSession: %v", err)
+			}
+			codec, err := goavro.NewCodec(session.GetAvroSchema().GetSchema())
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := bqReadClient.ReadRows(ctx, &storagepb.ReadRowsRequest{
+				ReadStream: session.GetStreams()[0].Name,
+			}, rpcOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for {
+				res, err := stream.Recv()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				buf := res.GetAvroRows().GetSerializedBinaryRows()
+				for len(buf) > 0 {
+					datum, rest, err := codec.NativeFromBinary(buf)
+					if err != nil {
+						t.Fatal(err)
+					}
+					buf = rest
+					got = append(got, fmt.Sprint(datum.(map[string]interface{})["name"]))
+				}
+			}
+			want := "from_" + dataset
+			if len(got) != 1 || !strings.Contains(got[0], want) {
+				t.Fatalf("storage read %s.t = %v; want [%s]", dataset, got, want)
+			}
+		})
 	}
 }
