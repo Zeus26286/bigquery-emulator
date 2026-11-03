@@ -66,7 +66,7 @@ REST surface. The tables below list every documented resource and method.
 
 | Method | Status | Notes |
 | --- | --- | --- |
-| `query` | ✅ | |
+| `query` | ✅ | **Behaviour change:** when a multi-statement query fails, the statements that ran before the failing one now keep their effects, as with `jobs.insert` and in BigQuery; previously `jobs.query` rolled everything back. See [scripting](#6-query-language-googlesql). |
 | `getQueryResults` | ✅ | Honors `maxResults` paging. |
 | `get` | ✅ | |
 | `list` | ✅ | |
@@ -194,9 +194,9 @@ lives in the [`googlesqlite` status](https://github.com/goccy/googlesqlite#statu
 | Feature | Status | Notes |
 | --- | --- | --- |
 | `SELECT` / query statements | ✅ | |
-| DDL (`CREATE` / `ALTER` / `DROP` for tables, views, materialized views, functions) | ✅ | DDL-created tables and views are registered as metadata. |
+| DDL (`CREATE` / `ALTER` / `DROP` for tables, views, materialized views, functions) | ✅ | DDL keeps the table metadata in sync, including `CREATE OR REPLACE` and `CREATE ... IF NOT EXISTS`. A script that fails partway keeps the effects of the statements before the failure, on both `jobs.insert` and `jobs.query`, as BigQuery does. A standalone `ALTER TABLE` supports `ADD COLUMN`, `DROP COLUMN` and `RENAME COLUMN` (each with `IF [NOT] EXISTS`) and `RENAME TO`; the table is rebuilt by copying its rows, so it costs O(rows), and a failed rebuild is rolled back. `OPTIONS(description=...)` on an added column (and its nested fields) is kept in the metadata. A partitioning or clustering column cannot be dropped or renamed. `DEFAULT`, `COLLATE` and generated columns in `ADD COLUMN` are rejected as unsupported. Limitations: `ALTER TABLE` inside a multi-statement script, and other `ALTER TABLE` actions (e.g. `SET OPTIONS`, `ALTER COLUMN`), are accepted but do nothing. The rebuild drops googlesqlite-side column defaults, `NOT NULL` constraints, primary keys and table options (the metadata keeps descriptions and modes). After `CREATE OR REPLACE`, a later statement in the same script still sees the old columns. When a script fails in a statement before its last one, the tables it created or dropped are missing from (or left in) the metadata until the next DDL on them. |
 | DML (`INSERT` / `UPDATE` / `DELETE` / `MERGE` / `TRUNCATE`) | ✅ | Subject to `googlesqlite` coverage. |
-| Scripting and multi-statement queries | ✅ | Subject to `googlesqlite` coverage. |
+| Scripting and multi-statement queries | ✅ | Subject to `googlesqlite` coverage. When a statement fails, the statements before it keep their effects (as in BigQuery, which has no implicit script transaction); a single failing statement changes nothing. **Behaviour change:** `jobs.query` used to roll back the whole query on any failure. It now commits the effects of the statements that ran before the failing one, the same as `jobs.insert`. |
 | Stored procedures | ✅ | Created via `routines.insert` or DDL. |
 | Built-in functions (~570) | ✅ | `googlesqlite` v0.1.0: 523/529 GoogleSQL + 55/59 BigQuery-specific. |
 | Data types (16 / 18) | ✅ | `NUMERIC` / `BIGNUMERIC` map to Arrow decimal types. |
