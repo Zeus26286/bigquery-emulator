@@ -7,6 +7,12 @@
 # The comparison logic is intentionally Ruby-specific (Time/Date/BigDecimal
 # mapping) -- verifying that per-language mapping is the point of the suite.
 
+# multi_json (used by the google-cloud gems) passes JSON.parse a positional
+# options hash, which json 3 rejects ("wrong number of arguments"). faraday's
+# unpinned json dependency installs json 3 alongside the json 2.x pinned in
+# gems.txt, so activate json < 3 before anything requires it.
+gem "json", "< 3"
+
 require "json"
 require "date"
 require "bigdecimal"

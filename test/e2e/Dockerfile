@@ -27,13 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ruby ruby-dev build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY clients/ruby/gems.txt /tmp/gems.txt
-# gems.txt pins json < 3: multi_json passes JSON.parse a positional options
-# hash, which json 3 rejects. faraday's unpinned `json` dependency still pulls
-# in the newest json, so remove any json >= 3 after installing.
-RUN gem install --no-document --install-dir /deps/ruby $(cat /tmp/gems.txt) \
-    && GEM_HOME=/deps/ruby GEM_PATH=/deps/ruby gem uninstall json -v '>= 3' \
-        --install-dir /deps/ruby --ignore-dependencies --executables \
-    && ! ls /deps/ruby/specifications | grep -q '^json-[3-9]'
+# gems.txt installs json 2.x next to whatever json faraday pulls in;
+# runner.rb activates the 2.x one (see the comment there).
+RUN gem install --no-document --install-dir /deps/ruby $(cat /tmp/gems.txt)
 
 # ---------------------------------------------------------------------------
 # PHP client dependencies
