@@ -84,7 +84,7 @@ tests: `TestCreateOrReplaceTableSyncsCatalog`,
 `TestAlterTableEdgeCases`, `TestFailedScriptSyncsCatalog`.
 
 Still needing googlesqlite fixes:
-- `ALTER` inside a multi-statement script is a no-op.
+- `ALTER` inside a multi-statement script is rejected with an explicit error.
 - A failure before a script's last statement leaves metadata stale until the
   next DDL on that table.
 - After `CREATE OR REPLACE`, later statements in the same script see the old
