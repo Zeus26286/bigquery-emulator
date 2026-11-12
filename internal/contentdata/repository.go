@@ -243,11 +243,24 @@ type ProjectedColumn struct {
 	Name string
 }
 
-// RebuildTableSQL returns a script that copies the rows of src into a new
-// table dst with the given columns, and drops src. When src and dst are the
-// same table, the rows go through the temporary table tmpTableID in the same
-// dataset. All paths are fully qualified.
-func (r *Repository) RebuildTableSQL(src, dst *bigqueryv2.TableReference, tmpTableID string, projection []ProjectedColumn) (string, error) {
+// ColumnDefinition is one column of the table created by
+// FinishRebuildTableSQL.
+type ColumnDefinition struct {
+	Name string
+	// Type is the column type, e.g. "INT64" or "STRUCT<`x` INT64>".
+	Type    string
+	NotNull bool
+	// Default is the DEFAULT expression, or empty for none. It is raw SQL,
+	// which the caller must have validated.
+	Default string
+}
+
+// RebuildTableSQL returns the first step of a table rebuild: a script that
+// copies the rows of src into the new table tmp, computing the given
+// columns, and drops src. tmp is a plain CREATE TABLE ... AS SELECT, so it
+// has no column constraints; FinishRebuildTableSQL creates the final table
+// from it. All paths are fully qualified.
+func (r *Repository) RebuildTableSQL(src, tmp *bigqueryv2.TableReference, projection []ProjectedColumn) (string, error) {
 	if len(projection) == 0 {
 		return "", fmt.Errorf("a table needs at least one column")
 	}
@@ -262,25 +275,104 @@ func (r *Repository) RebuildTableSQL(src, dst *bigqueryv2.TableReference, tmpTab
 	if err != nil {
 		return "", err
 	}
-	dstPath, err := r.tablePath(dst.ProjectId, dst.DatasetId, dst.TableId)
-	if err != nil {
-		return "", err
-	}
-	selectList := strings.Join(columns, ", ")
-	if srcPath != dstPath {
-		return fmt.Sprintf(
-			"CREATE TABLE `%s` AS SELECT %s FROM `%s`; DROP TABLE `%s`",
-			dstPath, selectList, srcPath, srcPath,
-		), nil
-	}
-	tmpPath, err := r.tablePath(src.ProjectId, src.DatasetId, tmpTableID)
+	tmpPath, err := r.tablePath(tmp.ProjectId, tmp.DatasetId, tmp.TableId)
 	if err != nil {
 		return "", err
 	}
 	return fmt.Sprintf(
-		"CREATE TABLE `%s` AS SELECT %s FROM `%s`; DROP TABLE `%s`; CREATE TABLE `%s` AS SELECT * FROM `%s`; DROP TABLE `%s`",
-		tmpPath, selectList, srcPath, srcPath, dstPath, tmpPath, tmpPath,
+		"CREATE TABLE `%s` AS SELECT %s FROM `%s`; DROP TABLE `%s`",
+		tmpPath, strings.Join(columns, ", "), srcPath, srcPath,
 	), nil
+}
+
+// FinishRebuildTableSQL returns the second step of a table rebuild: a script
+// that creates dst with the given column definitions, copies the rows of tmp
+// into it and drops tmp. The columns of tmp must have the names and the
+// order of columns. With no column definitions, dst is created by CREATE
+// TABLE ... AS SELECT and has no column constraints.
+func (r *Repository) FinishRebuildTableSQL(tmp, dst *bigqueryv2.TableReference, columns []ColumnDefinition) (string, error) {
+	tmpPath, err := r.tablePath(tmp.ProjectId, tmp.DatasetId, tmp.TableId)
+	if err != nil {
+		return "", err
+	}
+	dstPath, err := r.tablePath(dst.ProjectId, dst.DatasetId, dst.TableId)
+	if err != nil {
+		return "", err
+	}
+	if len(columns) == 0 {
+		return fmt.Sprintf(
+			"CREATE TABLE `%s` AS SELECT * FROM `%s`; DROP TABLE `%s`",
+			dstPath, tmpPath, tmpPath,
+		), nil
+	}
+	defs := make([]string, 0, len(columns))
+	names := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if err := validateIdent("column", column.Name); err != nil {
+			return "", err
+		}
+		if column.Type == "" {
+			return "", fmt.Errorf("type of column %s is unknown", column.Name)
+		}
+		name := fmt.Sprintf("`%s`", escapeIdent(column.Name))
+		def := name + " " + column.Type
+		if column.Default != "" {
+			def += fmt.Sprintf(" DEFAULT (%s)", column.Default)
+		}
+		if column.NotNull {
+			def += " NOT NULL"
+		}
+		defs = append(defs, def)
+		names = append(names, name)
+	}
+	nameList := strings.Join(names, ", ")
+	return fmt.Sprintf(
+		"CREATE TABLE `%s` (%s); INSERT INTO `%s` (%s) SELECT %s FROM `%s`; DROP TABLE `%s`",
+		dstPath, strings.Join(defs, ", "), dstPath, nameList, nameList, tmpPath, tmpPath,
+	), nil
+}
+
+// FieldDDLType returns the GoogleSQL type of a column for a CREATE TABLE
+// column definition, e.g. "ARRAY<STRUCT<`x` INT64>>". It reports false for a
+// type it cannot express, and for a field name that cannot be quoted.
+func FieldDDLType(field *bigqueryv2.TableFieldSchema) (string, bool) {
+	var elem string
+	switch strings.ToUpper(field.Type) {
+	case "INTEGER", "INT64":
+		elem = "INT64"
+	case "FLOAT", "FLOAT64":
+		elem = "FLOAT64"
+	case "BOOLEAN", "BOOL":
+		elem = "BOOL"
+	case "NUMERIC", "DECIMAL":
+		elem = "NUMERIC"
+	case "BIGNUMERIC", "BIGDECIMAL":
+		elem = "BIGNUMERIC"
+	case "STRING", "BYTES", "DATE", "DATETIME", "TIME", "TIMESTAMP", "GEOGRAPHY", "JSON", "INTERVAL":
+		elem = strings.ToUpper(field.Type)
+	case "RECORD", "STRUCT":
+		if len(field.Fields) == 0 {
+			return "", false
+		}
+		types := make([]string, 0, len(field.Fields))
+		for _, f := range field.Fields {
+			if validateIdent("column", f.Name) != nil {
+				return "", false
+			}
+			typ, ok := FieldDDLType(f)
+			if !ok {
+				return "", false
+			}
+			types = append(types, fmt.Sprintf("`%s` %s", escapeIdent(f.Name), typ))
+		}
+		elem = fmt.Sprintf("STRUCT<%s>", strings.Join(types, ", "))
+	default:
+		return "", false
+	}
+	if field.Mode == "REPEATED" {
+		return fmt.Sprintf("ARRAY<%s>", elem), true
+	}
+	return elem, true
 }
 
 func (r *Repository) CreateView(ctx context.Context, tx *connection.Tx, table *bigqueryv2.Table) error {

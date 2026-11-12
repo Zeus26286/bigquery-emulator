@@ -3,6 +3,8 @@ package contentdata
 import (
 	"strings"
 	"testing"
+
+	bigqueryv2 "google.golang.org/api/bigquery/v2"
 )
 
 func TestValidateIdent(t *testing.T) {
@@ -81,5 +83,86 @@ func TestEscapeIdent(t *testing.T) {
 	}
 	if got := escapeIdent("a`b"); !strings.Contains(got, "``") {
 		t.Errorf("escapeIdent(a`b) = %q, want a doubled backtick", got)
+	}
+}
+
+func TestRebuildTableSQL(t *testing.T) {
+	r := NewRepository()
+	src := &bigqueryv2.TableReference{ProjectId: "p", DatasetId: "ds", TableId: "t"}
+	tmp := &bigqueryv2.TableReference{ProjectId: "p", DatasetId: "ds", TableId: "tmp"}
+	dst := &bigqueryv2.TableReference{ProjectId: "p", DatasetId: "ds", TableId: "t2"}
+
+	got, err := r.RebuildTableSQL(src, tmp, []ProjectedColumn{
+		{Expr: "`a`", Name: "a"},
+		{Expr: "CAST(NULL AS STRING)", Name: "b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE `p.ds.tmp` AS SELECT `a` AS `a`, CAST(NULL AS STRING) AS `b` FROM `p.ds.t`; DROP TABLE `p.ds.t`"; got != want {
+		t.Errorf("RebuildTableSQL =\n%s\nwant\n%s", got, want)
+	}
+
+	got, err = r.FinishRebuildTableSQL(tmp, dst, []ColumnDefinition{
+		{Name: "a", Type: "INT64", NotNull: true},
+		{Name: "b", Type: "STRING", Default: "'q'"},
+		{Name: "s", Type: "STRUCT<`x y` INT64>", NotNull: true, Default: "STRUCT(1)"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE `p.ds.t2` (`a` INT64 NOT NULL, `b` STRING DEFAULT ('q'), `s` STRUCT<`x y` INT64> DEFAULT (STRUCT(1)) NOT NULL); " +
+		"INSERT INTO `p.ds.t2` (`a`, `b`, `s`) SELECT `a`, `b`, `s` FROM `p.ds.tmp`; DROP TABLE `p.ds.tmp`"; got != want {
+		t.Errorf("FinishRebuildTableSQL =\n%s\nwant\n%s", got, want)
+	}
+
+	got, err = r.FinishRebuildTableSQL(tmp, dst, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE `p.ds.t2` AS SELECT * FROM `p.ds.tmp`; DROP TABLE `p.ds.tmp`"; got != want {
+		t.Errorf("FinishRebuildTableSQL without definitions =\n%s\nwant\n%s", got, want)
+	}
+
+	if _, err := r.RebuildTableSQL(src, tmp, []ProjectedColumn{{Expr: "1", Name: "a`b"}}); err == nil {
+		t.Error("RebuildTableSQL accepted a column name with a backtick")
+	}
+	if _, err := r.FinishRebuildTableSQL(tmp, dst, []ColumnDefinition{{Name: "a\\b", Type: "INT64"}}); err == nil {
+		t.Error("FinishRebuildTableSQL accepted a column name with a backslash")
+	}
+	if _, err := r.FinishRebuildTableSQL(tmp, dst, []ColumnDefinition{{Name: "a"}}); err == nil {
+		t.Error("FinishRebuildTableSQL accepted a column without a type")
+	}
+}
+
+func TestFieldDDLType(t *testing.T) {
+	for _, c := range []struct {
+		field *bigqueryv2.TableFieldSchema
+		want  string
+	}{
+		{&bigqueryv2.TableFieldSchema{Type: "INTEGER"}, "INT64"},
+		{&bigqueryv2.TableFieldSchema{Type: "FLOAT"}, "FLOAT64"},
+		{&bigqueryv2.TableFieldSchema{Type: "BOOLEAN"}, "BOOL"},
+		{&bigqueryv2.TableFieldSchema{Type: "BIGNUMERIC"}, "BIGNUMERIC"},
+		{&bigqueryv2.TableFieldSchema{Type: "json"}, "JSON"},
+		{&bigqueryv2.TableFieldSchema{Type: "STRING", Mode: "REPEATED"}, "ARRAY<STRING>"},
+		{&bigqueryv2.TableFieldSchema{Type: "RECORD", Mode: "REPEATED", Fields: []*bigqueryv2.TableFieldSchema{
+			{Name: "select", Type: "INTEGER"},
+			{Name: "s", Type: "RECORD", Fields: []*bigqueryv2.TableFieldSchema{{Name: "t", Type: "TIMESTAMP", Mode: "REPEATED"}}},
+		}}, "ARRAY<STRUCT<`select` INT64, `s` STRUCT<`t` ARRAY<TIMESTAMP>>>>"},
+	} {
+		got, ok := FieldDDLType(c.field)
+		if !ok || got != c.want {
+			t.Errorf("FieldDDLType(%+v) = %q, %v; want %q", c.field, got, ok, c.want)
+		}
+	}
+	for _, field := range []*bigqueryv2.TableFieldSchema{
+		{Type: "RANGE"},
+		{Type: "RECORD"},
+		{Type: "RECORD", Fields: []*bigqueryv2.TableFieldSchema{{Name: "a`", Type: "INTEGER"}}},
+	} {
+		if got, ok := FieldDDLType(field); ok {
+			t.Errorf("FieldDDLType(%+v) = %q, want not ok", field, got)
+		}
 	}
 }

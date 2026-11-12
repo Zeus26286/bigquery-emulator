@@ -84,14 +84,14 @@ func TestSyncCatalogIgnoresTempAndUnknownTables(t *testing.T) {
 			},
 		},
 		Function: &googlesqlite.ChangedFunction{},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.needsRefresh || len(res.repairTables) != 0 {
 		t.Fatalf("unexpected sync result %+v", res)
 	}
-	if _, err := syncCatalog(ctx, s, nil, nil); err != nil {
+	if _, err := syncCatalog(ctx, s, nil, nil, nil); err != nil {
 		t.Fatalf("nil catalog: %v", err)
 	}
 }

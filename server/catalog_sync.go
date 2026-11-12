@@ -34,7 +34,11 @@ type skipTableFunc func(projectID, datasetID, tableID string) bool
 // unknown table is a no-op, and temp tables are ignored. That way it also
 // repairs metadata that drifted earlier, e.g. after a script that failed
 // before its catalog changes could be read.
-func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog, skip skipTableFunc) (*catalogSyncResult, error) {
+//
+// ddl is the analysis of the query's text, which adds what the statements
+// say beyond the column names and types (partitioning, options, ...); it may
+// be nil.
+func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog, skip skipTableFunc, ddl *ddlInfo) (*catalogSyncResult, error) {
 	result := &catalogSyncResult{}
 	if cat == nil || cat.Table == nil || !cat.Table.Changed() {
 		return result, nil
@@ -144,7 +148,13 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		}
 		fields := make([]*bigqueryv2.TableFieldSchema, 0, len(spec.Columns))
 		for _, column := range spec.Columns {
-			fields = append(fields, types.TableFieldSchemaFromColumnType(column.Name, column.Type))
+			field := types.TableFieldSchemaFromColumnType(column.Name, column.Type)
+			// googlesqlite enforces NOT NULL, so the column is REQUIRED
+			// even when the query's text could not be analyzed.
+			if column.IsNotNull && field.Mode != "REPEATED" {
+				field.Mode = "REQUIRED"
+			}
+			fields = append(fields, field)
 		}
 		table := &bigqueryv2.Table{
 			TableReference: &bigqueryv2.TableReference{
@@ -158,6 +168,14 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		// view so it is typed correctly and dropped with DROP VIEW.
 		if spec.IsView {
 			table.View = &bigqueryv2.ViewDefinition{Query: spec.Query}
+		}
+		if create := ddl.lookup(spec.NamePath, spec.IsView); create != nil {
+			create.apply(ctx, table)
+		}
+		if !spec.IsView && table.TableConstraints == nil && len(spec.PrimaryKey) != 0 {
+			table.TableConstraints = &bigqueryv2.TableConstraints{
+				PrimaryKey: &bigqueryv2.TableConstraintsPrimaryKey{Columns: spec.PrimaryKey},
+			}
 		}
 		if _, err := createTableMetadata(ctx, tx, server, project, dataset, table); err != nil {
 			return nil, err

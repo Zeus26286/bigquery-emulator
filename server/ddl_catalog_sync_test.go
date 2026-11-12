@@ -599,13 +599,13 @@ func TestAlterTableEdgeCases(t *testing.T) {
 		assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "cmt"), "a", "b", "c")
 	})
 
-	t.Run("multi_statement_script_is_noop", func(t *testing.T) {
+	t.Run("multi_statement_script_is_rejected", func(t *testing.T) {
 		// Documented limitation: ALTER TABLE inside a multi-statement
-		// script is left to googlesqlite, which runs it as a no-op.
+		// script is rejected, and nothing in the script runs.
 		env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.ms (a INT64)")
-		env.mustExec(t, "jobs.insert", "ALTER TABLE dataset1.ms ADD COLUMN b STRING; INSERT INTO dataset1.ms (a) VALUES (7)")
+		assertErrContains(t, env.runQueryJob(t, "ALTER TABLE dataset1.ms ADD COLUMN b STRING; INSERT INTO dataset1.ms (a) VALUES (7)"), "ALTER TABLE inside a multi-statement script is not supported")
 		assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "ms"), "a")
-		if rows := env.mustRead(t, "SELECT * FROM dataset1.ms"); len(rows) != 1 || len(rows[0]) != 1 {
+		if rows := env.mustRead(t, "SELECT * FROM dataset1.ms"); len(rows) != 0 {
 			t.Fatalf("rows: got %v", rows)
 		}
 	})

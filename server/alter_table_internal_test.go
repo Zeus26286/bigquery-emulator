@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -129,7 +130,7 @@ func (e *alterGuardEnv) execDirect(sql string) (err error) {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return syncQueryCatalog(ctx, e.server, "test", "", response, nil, nil)
+	return syncQueryCatalog(ctx, e.server, "test", "", nil, response, nil, nil, nil)
 }
 
 func (e *alterGuardEnv) mustExec(t *testing.T, sql string) {
@@ -273,5 +274,126 @@ func TestAlterTableTempTableName(t *testing.T) {
 	}
 	if !strings.HasPrefix(tmpID, alterTmpTablePrefix) || len(tmpID) > 64 || strings.Contains(tmpID, long) {
 		t.Fatalf("temp table name %q", tmpID)
+	}
+}
+
+func TestParseAlterTableNewActions(t *testing.T) {
+	for _, c := range []struct {
+		query string
+		check func(*alterAction) bool
+	}{
+		{"ALTER TABLE ds.t SET OPTIONS(description='d', labels=[('k','v')])", func(a *alterAction) bool {
+			return a.kind == alterSetTableOptions && len(a.options) == 2 && a.options[0].name == "description" && a.options[0].value == "d" && a.options[1].name == "labels"
+		}},
+		{"ALTER TABLE ds.t SET OPTIONS(expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY))", func(a *alterAction) bool {
+			return a.kind == alterSetTableOptions && !a.options[0].isLiteral && a.options[0].exprText == "TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)"
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN IF EXISTS a SET OPTIONS(description=NULL)", func(a *alterAction) bool {
+			return a.kind == alterSetColumnOptions && a.name == "a" && a.ifExists && a.options[0].isLiteral && a.options[0].value == nil
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN a DROP NOT NULL", func(a *alterAction) bool {
+			return a.kind == alterDropNotNull && a.name == "a"
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN a SET DATA TYPE NUMERIC(10, 2)", func(a *alterAction) bool {
+			return a.kind == alterSetDataType && a.newType.name == "NUMERIC" && reflect.DeepEqual(a.newType.params, []int64{10, 2})
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN a SET DATA TYPE integer", func(a *alterAction) bool {
+			return a.kind == alterSetDataType && a.newType.name == "INT64" && len(a.newType.params) == 0
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN a SET DEFAULT CONCAT('a', 'b')", func(a *alterAction) bool {
+			return a.kind == alterSetDefault && a.defaultText == "CONCAT('a', 'b')"
+		}},
+		{"ALTER TABLE ds.t ALTER COLUMN a DROP DEFAULT", func(a *alterAction) bool {
+			return a.kind == alterDropDefault && a.name == "a"
+		}},
+		{"ALTER TABLE ds.t ADD PRIMARY KEY (a, b) NOT ENFORCED", func(a *alterAction) bool {
+			return a.kind == alterAddPrimaryKey && reflect.DeepEqual(a.columns, []string{"a", "b"})
+		}},
+		{"ALTER TABLE ds.t DROP PRIMARY KEY IF EXISTS", func(a *alterAction) bool {
+			return a.kind == alterDropPrimaryKey && a.ifExists
+		}},
+	} {
+		stmt, ok, err := parseAlterTable(c.query)
+		if err != nil || !ok || len(stmt.actions) != 1 || !c.check(stmt.actions[0]) {
+			var action *alterAction
+			if stmt != nil && len(stmt.actions) != 0 {
+				action = stmt.actions[0]
+			}
+			t.Errorf("%s: got %+v, %v, %v", c.query, action, ok, err)
+		}
+	}
+	for query, want := range map[string]string{
+		"ALTER TABLE ds.t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES ds.k(id) NOT ENFORCED": "ALTER TABLE ADD CONSTRAINT is not supported by the emulator",
+		"ALTER TABLE ds.t DROP CONSTRAINT fk":                                                 "ALTER TABLE DROP CONSTRAINT is not supported by the emulator",
+		"ALTER TABLE ds.t ADD PRIMARY KEY (a)":                                                "PRIMARY KEY must be NOT ENFORCED",
+		"ALTER TABLE ds.t ALTER COLUMN a SET DATA TYPE ARRAY<INT64>":                          "SET DATA TYPE: this type is not supported",
+		"ALTER TABLE ds.t ADD COLUMN b STRING, SET DEFAULT COLLATE 'und:ci'":                  "ALTER TABLE SET DEFAULT COLLATE is not supported by the emulator",
+		"ALTER TABLE ds.t ALTER CONSTRAINT x NOT ENFORCED":                                    "is not supported by the emulator",
+		"ALTER TABLE ds.t ADD COLUMN b STRING FILL USING 1":                                   "FILL USING is not supported",
+	} {
+		_, ok, err := parseAlterTable(query)
+		if ok || err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, %v; want an error containing %q", query, ok, err, want)
+		}
+	}
+	// SET OPTIONS with += is parsed; planAlterTable rejects it.
+	stmt, ok, err := parseAlterTable("ALTER TABLE ds.t SET OPTIONS(labels += [('k','v')])")
+	if err != nil || !ok || stmt.actions[0].options[0].assign {
+		t.Fatalf("labels +=: got %+v, %v, %v", stmt, ok, err)
+	}
+	if err := checkAlterOption("ALTER TABLE SET OPTIONS", stmt.actions[0].options[0], tableOptionNames); err == nil {
+		t.Fatal("checkAlterOption accepted +=")
+	}
+	// A parse failure is left to googlesqlite.
+	if _, ok, err := parseAlterTable("ALTER TABLE ds.t ADD COLUMN"); ok || err != nil {
+		t.Fatalf("syntax error: got %v, %v", ok, err)
+	}
+}
+
+func TestSetDataTypeAllowed(t *testing.T) {
+	typ := func(name string, params ...int64) *columnTypeName {
+		return &columnTypeName{name: name, params: params}
+	}
+	for _, c := range []struct {
+		from, to      *columnTypeName
+		allowed, same bool
+	}{
+		{typ("INT64"), typ("NUMERIC"), true, false},
+		{typ("INT64"), typ("BIGNUMERIC"), true, false},
+		{typ("INT64"), typ("FLOAT64"), true, false},
+		{typ("NUMERIC"), typ("BIGNUMERIC"), true, false},
+		{typ("NUMERIC"), typ("FLOAT64"), true, false},
+		{typ("INT64"), typ("INT64"), true, true},
+		{typ("STRING", 10), typ("STRING", 20), true, false},
+		{typ("STRING", 10), typ("STRING"), true, false},
+		{typ("STRING", 10), typ("STRING", 10), true, true},
+		{typ("BYTES", 10), typ("BYTES", 5), false, false},
+		{typ("STRING"), typ("STRING", 10), false, false},
+		{typ("NUMERIC", 10, 2), typ("NUMERIC", 12, 3), true, false},
+		{typ("NUMERIC", 10, 2), typ("NUMERIC", 10, 3), false, false},
+		{typ("NUMERIC", 10, 2), typ("NUMERIC"), true, false},
+		{typ("STRING"), typ("INT64"), false, false},
+		{typ("FLOAT64"), typ("INT64"), false, false},
+		{typ("NUMERIC"), typ("INT64"), false, false},
+		{typ("INT64"), typ("NUMERIC", 20, 0), false, false},
+		{typ("TIMESTAMP"), typ("DATE"), false, false},
+	} {
+		allowed, same := setDataTypeAllowed(c.from, c.to)
+		if allowed != c.allowed || same != c.same {
+			t.Errorf("%s -> %s: got allowed=%v same=%v, want %v %v", c.from, c.to, allowed, same, c.allowed, c.same)
+		}
+	}
+}
+
+func TestValidateDefaultExpression(t *testing.T) {
+	for _, text := range []string{"'x'", "CURRENT_TIMESTAMP()", "CONCAT('a', 'b')", "1 + 2"} {
+		if err := validateDefaultExpression(text); err != nil {
+			t.Errorf("%s: %v", text, err)
+		}
+	}
+	for _, text := range []string{"", "1); DROP TABLE x; SELECT (1", "1, 2", "SELECT 1"} {
+		if err := validateDefaultExpression(text); err == nil {
+			t.Errorf("%q: want an error", text)
+		}
 	}
 }
