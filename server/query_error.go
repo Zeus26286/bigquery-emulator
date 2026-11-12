@@ -21,7 +21,7 @@ import (
 
 var (
 	alreadyExistsPattern = regexp.MustCompile("(?:table|view) `([^`]+)` already exists")
-	notNullPattern       = regexp.MustCompile(`NOT NULL constraint failed: [^\s.]+\.([^\s,;]+)`)
+	notNullPattern       = regexp.MustCompile(`NOT NULL constraint failed: ([^\s,;]+)`)
 	didYouMeanPattern    = regexp.MustCompile(`; Did you mean ([^?]+)\?`)
 )
 
@@ -44,7 +44,10 @@ func translateQueryError(err error, projectID string, ddl *ddlInfo) error {
 		return err
 	}
 	if m := notNullPattern.FindStringSubmatch(msg); m != nil {
-		column := strings.Trim(m[1], "`\"[]")
+		// The internal table name may contain dots, e.g. for a project
+		// such as google.com:p, so the column follows the last one.
+		column := m[1][strings.LastIndex(m[1], ".")+1:]
+		column = strings.Trim(column, "`\"[]")
 		return fmt.Errorf("Required field %s cannot be null", column)
 	}
 	if strings.Contains(msg, "Table not found:") {

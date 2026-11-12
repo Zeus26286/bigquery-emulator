@@ -106,6 +106,7 @@ func TestDDLMetadata(t *testing.T) {
 		test func(t *testing.T, env *ddlTestEnv, mode, ds string)
 	}{
 		{"create_table_partitioning", testCreateTablePartitioningMetadata},
+		{"create_table_partitioning_types", testCreateTablePartitioningTypes},
 		{"create_table_clustering", testCreateTableClusteringMetadata},
 		{"create_table_options", testCreateTableOptionsMetadata},
 		{"create_table_column", testCreateTableColumnMetadata},
@@ -183,6 +184,32 @@ func testCreateTablePartitioningMetadata(t *testing.T, env *ddlTestEnv, mode, ds
 	}
 	if !md.RequirePartitionFilter {
 		t.Fatal("requirePartitionFilter: got false")
+	}
+}
+
+// testCreateTablePartitioningTypes checks that a PARTITION BY that does not
+// apply to the type of its column is not recorded.
+func testCreateTablePartitioningTypes(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	for table, ddl := range map[string]string{
+		"pt1": "(x INT64) PARTITION BY x",
+		"pt2": "(d DATE) PARTITION BY DATE_TRUNC(d, HOUR)",
+		"pt3": "(ts TIMESTAMP) PARTITION BY DATETIME_TRUNC(ts, DAY)",
+		"pt4": "(d DATE) PARTITION BY DATE(d)",
+		"pt5": "(s STRING) PARTITION BY RANGE_BUCKET(s, GENERATE_ARRAY(0, 10))",
+	} {
+		// googlesqlite accepts some of these; when it does, nothing is
+		// recorded.
+		if err := env.exec(t, mode, "CREATE TABLE "+ds+"."+table+" "+ddl); err != nil {
+			continue
+		}
+		md := env.metadata(t, ds, table)
+		if md.TimePartitioning != nil || md.RangePartitioning != nil {
+			t.Fatalf("%s: got timePartitioning %+v, rangePartitioning %+v", table, md.TimePartitioning, md.RangePartitioning)
+		}
+	}
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".pt6 (a INT64) PARTITION BY DATE_TRUNC(_PARTITIONDATE, MONTH)")
+	if md := env.metadata(t, ds, "pt6"); md.TimePartitioning == nil || md.TimePartitioning.Type != bigquery.MonthPartitioningType || md.TimePartitioning.Field != "" {
+		t.Fatalf("pt6: got %+v", md.TimePartitioning)
 	}
 }
 

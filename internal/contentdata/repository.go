@@ -305,19 +305,54 @@ func (r *Repository) FinishRebuildTableSQL(tmp, dst *bigqueryv2.TableReference, 
 			dstPath, tmpPath, tmpPath,
 		), nil
 	}
+	defs, names, err := columnDefinitions(columns)
+	if err != nil {
+		return "", err
+	}
+	nameList := strings.Join(names, ", ")
+	return fmt.Sprintf(
+		"CREATE TABLE `%s` (%s); INSERT INTO `%s` (%s) SELECT %s FROM `%s`; DROP TABLE `%s`",
+		dstPath, defs, dstPath, nameList, nameList, tmpPath, tmpPath,
+	), nil
+}
+
+// RestoreTableSpecSQL returns a CREATE TABLE IF NOT EXISTS statement for a
+// table that exists in SQLite. SQLite leaves the table alone, while
+// googlesqlite records the given column definitions as the table's spec
+// (see RestoreTableSpec), including their constraints.
+func (r *Repository) RestoreTableSpecSQL(ref *bigqueryv2.TableReference, columns []ColumnDefinition) (string, error) {
+	path, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+	if err != nil {
+		return "", err
+	}
+	if len(columns) == 0 {
+		return "", fmt.Errorf("a table needs at least one column")
+	}
+	defs, _, err := columnDefinitions(columns)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (%s)", path, defs), nil
+}
+
+// columnDefinitions returns the column definition list of a CREATE TABLE
+// statement and the quoted column names. A DEFAULT expression is closed on
+// a line of its own, so that a trailing line comment in it cannot comment
+// out the rest of the statement.
+func columnDefinitions(columns []ColumnDefinition) (string, []string, error) {
 	defs := make([]string, 0, len(columns))
 	names := make([]string, 0, len(columns))
 	for _, column := range columns {
 		if err := validateIdent("column", column.Name); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if column.Type == "" {
-			return "", fmt.Errorf("type of column %s is unknown", column.Name)
+			return "", nil, fmt.Errorf("type of column %s is unknown", column.Name)
 		}
 		name := fmt.Sprintf("`%s`", escapeIdent(column.Name))
 		def := name + " " + column.Type
 		if column.Default != "" {
-			def += fmt.Sprintf(" DEFAULT (%s)", column.Default)
+			def += fmt.Sprintf(" DEFAULT (%s\n)", column.Default)
 		}
 		if column.NotNull {
 			def += " NOT NULL"
@@ -325,11 +360,7 @@ func (r *Repository) FinishRebuildTableSQL(tmp, dst *bigqueryv2.TableReference, 
 		defs = append(defs, def)
 		names = append(names, name)
 	}
-	nameList := strings.Join(names, ", ")
-	return fmt.Sprintf(
-		"CREATE TABLE `%s` (%s); INSERT INTO `%s` (%s) SELECT %s FROM `%s`; DROP TABLE `%s`",
-		dstPath, strings.Join(defs, ", "), dstPath, nameList, nameList, tmpPath, tmpPath,
-	), nil
+	return strings.Join(defs, ", "), names, nil
 }
 
 // FieldDDLType returns the GoogleSQL type of a column for a CREATE TABLE

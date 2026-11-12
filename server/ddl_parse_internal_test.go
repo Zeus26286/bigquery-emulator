@@ -49,22 +49,22 @@ func TestAnalyzeDDLCreateTable(t *testing.T) {
 		{
 			name:  "partition_date_function",
 			query: "CREATE TABLE ds.t (ts TIMESTAMP) PARTITION BY DATE(ts)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"ts": {}}, partition: &partitionSpec{kind: "time", unit: "DAY", column: "ts"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"ts": {}}, partition: &partitionSpec{kind: "time", unit: "DAY", column: "ts", function: "DATE"}}},
 		},
 		{
 			name:  "partition_timestamp_trunc",
 			query: "CREATE TABLE ds.t (ts TIMESTAMP) PARTITION BY timestamp_trunc(ts, month)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"ts": {}}, partition: &partitionSpec{kind: "time", unit: "MONTH", column: "ts"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"ts": {}}, partition: &partitionSpec{kind: "time", unit: "MONTH", column: "ts", function: "TIMESTAMP_TRUNC"}}},
 		},
 		{
 			name:  "partition_datetime_trunc",
 			query: "CREATE TABLE ds.t (dt DATETIME) PARTITION BY DATETIME_TRUNC(dt, YEAR)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"dt": {}}, partition: &partitionSpec{kind: "time", unit: "YEAR", column: "dt"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"dt": {}}, partition: &partitionSpec{kind: "time", unit: "YEAR", column: "dt", function: "DATETIME_TRUNC"}}},
 		},
 		{
 			name:  "partition_date_trunc",
 			query: "CREATE TABLE ds.t (d DATE) PARTITION BY DATE_TRUNC(d, MONTH)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"d": {}}, partition: &partitionSpec{kind: "time", unit: "MONTH", column: "d"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"d": {}}, partition: &partitionSpec{kind: "time", unit: "MONTH", column: "d", function: "DATE_TRUNC"}}},
 		},
 		{
 			name:  "partition_ingestion_date",
@@ -74,12 +74,12 @@ func TestAnalyzeDDLCreateTable(t *testing.T) {
 		{
 			name:  "partition_ingestion_time",
 			query: "CREATE TABLE ds.t (a INT64) PARTITION BY DATE(_PARTITIONTIME)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}, partition: &partitionSpec{kind: "time", unit: "DAY"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}, partition: &partitionSpec{kind: "time", unit: "DAY", function: "DATE"}}},
 		},
 		{
 			name:  "partition_ingestion_hour",
 			query: "CREATE TABLE ds.t (a INT64) PARTITION BY TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)",
-			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}, partition: &partitionSpec{kind: "time", unit: "HOUR"}}},
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}, partition: &partitionSpec{kind: "time", unit: "HOUR", function: "TIMESTAMP_TRUNC"}}},
 		},
 		{
 			name:  "partition_range",
@@ -92,6 +92,21 @@ func TestAnalyzeDDLCreateTable(t *testing.T) {
 			want:  []create{{ref: "p.ds.t", columns: map[string]column{"id": {}}, partition: &partitionSpec{kind: "range", column: "id", start: 0, end: 100, interval: 10}}},
 		},
 		{
+			name:  "partition_ingestion_month",
+			query: "CREATE TABLE ds.t (a INT64) PARTITION BY DATE_TRUNC(_PARTITIONDATE, MONTH)",
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}, partition: &partitionSpec{kind: "time", unit: "MONTH", function: "DATE_TRUNC"}}},
+		},
+		{
+			name:  "partition_date_trunc_hour",
+			query: "CREATE TABLE ds.t (d DATE) PARTITION BY DATE_TRUNC(d, HOUR)",
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"d": {}}}},
+		},
+		{
+			name:  "partition_datetime_trunc_ingestion",
+			query: "CREATE TABLE ds.t (a INT64) PARTITION BY DATETIME_TRUNC(_PARTITIONTIME, DAY)",
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{"a": {}}}},
+		},
+		{
 			name:  "partition_unrecognised",
 			query: "CREATE TABLE ds.t (id INT64) PARTITION BY MOD(id, 2)",
 			want:  []create{{ref: "p.ds.t", columns: map[string]column{"id": {}}}},
@@ -102,7 +117,7 @@ func TestAnalyzeDDLCreateTable(t *testing.T) {
 			want: []create{{
 				ref:        "p.ds.t",
 				columns:    map[string]column{},
-				partition:  &partitionSpec{kind: "time", unit: "DAY", column: "ts"},
+				partition:  &partitionSpec{kind: "time", unit: "DAY", column: "ts", function: "DATE"},
 				clustering: []string{"name", "id"},
 				options: map[string]any{
 					"description":               "d",
@@ -291,6 +306,11 @@ func TestTranslateQueryError(t *testing.T) {
 			want: "Required field a cannot be null",
 		},
 		{
+			name: "not_null_domain_scoped_project",
+			err:  "sqlite3: constraint failed: NOT NULL constraint failed: google.com:p_ds_t.col_a",
+			want: "Required field col_a cannot be null",
+		},
+		{
 			name: "did_you_mean_dataset",
 			err:  "failed to analyze: Table not found: ds.cp1; Did you mean ds.test_ds_c1? [at 1:15]",
 			want: "failed to analyze: Table not found: ds.cp1; Did you mean ds.c1? [at 1:15]",
@@ -398,5 +418,34 @@ func TestDDLParserOptionsParseAlterTable(t *testing.T) {
 	}
 	if _, _, err := parseAlterTable("ALTER TABLE ds.t ADD COLUMN c STRING DEFAULT 'x'"); err == nil || !strings.Contains(err.Error(), "DEFAULT is not supported") {
 		t.Fatalf("ADD COLUMN DEFAULT: got %v", err)
+	}
+}
+
+func TestPartitionColumnTypeOK(t *testing.T) {
+	for _, c := range []struct {
+		spec    *partitionSpec
+		typ     string
+		mode    string
+		allowed bool
+	}{
+		{&partitionSpec{kind: "time", function: ""}, "DATE", "", true},
+		{&partitionSpec{kind: "time", function: ""}, "INTEGER", "", false},
+		{&partitionSpec{kind: "time", function: ""}, "TIMESTAMP", "", false},
+		{&partitionSpec{kind: "time", function: "DATE"}, "TIMESTAMP", "", true},
+		{&partitionSpec{kind: "time", function: "DATE"}, "DATETIME", "", true},
+		{&partitionSpec{kind: "time", function: "DATE"}, "DATE", "", false},
+		{&partitionSpec{kind: "time", function: "TIMESTAMP_TRUNC"}, "TIMESTAMP", "", true},
+		{&partitionSpec{kind: "time", function: "TIMESTAMP_TRUNC"}, "DATETIME", "", false},
+		{&partitionSpec{kind: "time", function: "DATETIME_TRUNC"}, "DATETIME", "", true},
+		{&partitionSpec{kind: "time", function: "DATE_TRUNC"}, "DATE", "", true},
+		{&partitionSpec{kind: "time", function: "DATE_TRUNC"}, "TIMESTAMP", "", false},
+		{&partitionSpec{kind: "time", function: ""}, "DATE", "REPEATED", false},
+		{&partitionSpec{kind: "range"}, "INTEGER", "", true},
+		{&partitionSpec{kind: "range"}, "STRING", "", false},
+	} {
+		field := &bigqueryv2.TableFieldSchema{Name: "c", Type: c.typ, Mode: c.mode}
+		if got := partitionColumnTypeOK(c.spec, field); got != c.allowed {
+			t.Errorf("%+v on %s %s: got %v, want %v", c.spec, c.typ, c.mode, got, c.allowed)
+		}
 	}
 }

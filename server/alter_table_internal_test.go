@@ -386,14 +386,128 @@ func TestSetDataTypeAllowed(t *testing.T) {
 }
 
 func TestValidateDefaultExpression(t *testing.T) {
-	for _, text := range []string{"'x'", "CURRENT_TIMESTAMP()", "CONCAT('a', 'b')", "1 + 2"} {
+	// A trailing comment is allowed: the generated SQL closes the
+	// expression on a new line.
+	for _, text := range []string{"'x'", "CURRENT_TIMESTAMP()", "CONCAT('a', 'b')", "1 + 2", "1 --", "1 #", "1 /* x */"} {
 		if err := validateDefaultExpression(text); err != nil {
 			t.Errorf("%s: %v", text, err)
 		}
 	}
-	for _, text := range []string{"", "1); DROP TABLE x; SELECT (1", "1, 2", "SELECT 1"} {
+	for _, text := range []string{"", "1); DROP TABLE x; SELECT (1", "1) NOT NULL, `zz` INT64 DEFAULT (2", "1, 2", "SELECT 1", "(SELECT 1)", "1 + (SELECT MAX(a) FROM t)", "1 /* x"} {
 		if err := validateDefaultExpression(text); err == nil {
 			t.Errorf("%q: want an error", text)
 		}
+	}
+}
+
+// TestAlterRebuildFailureKeepsTable checks that a failed ALTER TABLE leaves
+// the table usable: rolling back a rebuild whose first step ran must not
+// leave googlesqlite's analyzer catalog without the table.
+func TestAlterRebuildFailureKeepsTable(t *testing.T) {
+	env := newAlterGuardEnv(t)
+	t.Cleanup(func() { setAlterFinishHook(nil) })
+	check := func(t *testing.T, table string, wantRows int) {
+		t.Helper()
+		rows, err := env.read("SELECT a, b FROM dataset1." + table + " ORDER BY a")
+		if err != nil || len(rows) != wantRows {
+			t.Fatalf("SELECT: got %v, %v; want %d rows", rows, err, wantRows)
+		}
+		// The table keeps its DEFAULT and NOT NULL constraints.
+		if err := env.exec("jobs.insert", fmt.Sprintf("INSERT INTO dataset1.%s (a) VALUES (%d)", table, 100+wantRows)); err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+		rows, err = env.read(fmt.Sprintf("SELECT b FROM dataset1.%s WHERE a = %d", table, 100+wantRows))
+		if err != nil || len(rows) != 1 || rows[0][0] != "q" {
+			t.Fatalf("DEFAULT: got %v, %v", rows, err)
+		}
+		if err := env.exec("jobs.insert", "INSERT INTO dataset1."+table+" (b) VALUES ('n')"); err == nil || !strings.Contains(err.Error(), "Required field a cannot be null") {
+			t.Fatalf("NOT NULL: got %v", err)
+		}
+		it := env.client.Dataset("dataset1").Tables(env.ctx)
+		for {
+			tbl, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(tbl.TableID, alterTmpTablePrefix) {
+				t.Fatalf("rebuild table %s left behind", tbl.TableID)
+			}
+		}
+	}
+	for _, mode := range []string{"jobs.insert", "jobs.query"} {
+		t.Run("wrong_type_default/"+mode, func(t *testing.T) {
+			table := "rbd_" + strings.ReplaceAll(mode, ".", "_")
+			env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64 NOT NULL, b STRING DEFAULT 'q')")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (a, b) VALUES (1, 'x'), (2, 'y')")
+			err := env.exec(mode, "ALTER TABLE dataset1."+table+" ALTER COLUMN a SET DEFAULT 'abc'")
+			if err == nil || !strings.Contains(err.Error(), "Invalid default value expression for column a: an expression of type STRING cannot be assigned to a column of type INT64") {
+				t.Fatalf("ALTER: got %v", err)
+			}
+			check(t, table, 2)
+			if err := env.exec(mode, "ALTER TABLE dataset1."+table+" ADD COLUMN c INT64"); err != nil {
+				t.Fatalf("next ALTER: %v", err)
+			}
+			check(t, table, 3)
+		})
+
+		t.Run("second_step_fails/"+mode, func(t *testing.T) {
+			table := "rbf_" + strings.ReplaceAll(mode, ".", "_")
+			env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64 NOT NULL, b STRING DEFAULT 'q')")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (a, b) VALUES (1, 'x'), (2, 'y')")
+			setAlterFinishHook(func(string) string {
+				setAlterFinishHook(nil)
+				return "SELECT ERROR('second step failed')"
+			})
+			err := env.exec(mode, "ALTER TABLE dataset1."+table+" ADD COLUMN c INT64")
+			if err == nil || !strings.Contains(err.Error(), "second step failed") {
+				t.Fatalf("ALTER: got %v", err)
+			}
+			md, err := env.client.Dataset("dataset1").Table(table).Metadata(env.ctx)
+			if err != nil || len(md.Schema) != 2 {
+				t.Fatalf("metadata: got %+v, %v", md, err)
+			}
+			check(t, table, 2)
+			if err := env.exec(mode, "ALTER TABLE dataset1."+table+" ADD COLUMN c INT64"); err != nil {
+				t.Fatalf("next ALTER: %v", err)
+			}
+			check(t, table, 3)
+		})
+	}
+
+	// A defaultValueExpression of the metadata that is not a valid DEFAULT
+	// (tables.patch input) is dropped instead of failing the rebuild.
+	for i, expr := range []string{"1 --", "1 #", "(SELECT 1)", "1) NOT NULL, `zz` INT64 DEFAULT (2", "'abc'"} {
+		t.Run(fmt.Sprintf("patched_default_%d", i), func(t *testing.T) {
+			table := fmt.Sprintf("rbp_%d", i)
+			env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64 DEFAULT 5, b STRING)")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (b) VALUES ('x')")
+			tbl := env.client.Dataset("dataset1").Table(table)
+			md, err := tbl.Metadata(env.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			schema := md.Schema
+			schema[0].DefaultValueExpression = expr
+			if _, err := tbl.Update(env.ctx, bigquery.TableMetadataToUpdate{Schema: schema}, ""); err != nil {
+				t.Fatal(err)
+			}
+			env.mustExec(t, "ALTER TABLE dataset1."+table+" ADD COLUMN c INT64")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (b) VALUES ('y')")
+			rows, err := env.read("SELECT a, b, c FROM dataset1." + table + " ORDER BY b")
+			if err != nil || len(rows) != 2 || rows[0][0] != int64(5) {
+				t.Fatalf("rows: got %v, %v", rows, err)
+			}
+			// "1 --" and "1 #" are valid expressions and stay the
+			// DEFAULT; the others are dropped.
+			if want := map[int]any{0: int64(1), 1: int64(1)}[i]; rows[1][0] != want {
+				t.Fatalf("default after the rebuild: got %v, want %v", rows[1][0], want)
+			}
+			if rows, err := env.read("SELECT * FROM dataset1." + table); err != nil || len(rows) != 2 || len(rows[0]) != 3 {
+				t.Fatalf("SELECT *: got %v, %v", rows, err)
+			}
+		})
 	}
 }

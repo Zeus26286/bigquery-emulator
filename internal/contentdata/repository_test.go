@@ -111,7 +111,7 @@ func TestRebuildTableSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "CREATE TABLE `p.ds.t2` (`a` INT64 NOT NULL, `b` STRING DEFAULT ('q'), `s` STRUCT<`x y` INT64> DEFAULT (STRUCT(1)) NOT NULL); " +
+	if want := "CREATE TABLE `p.ds.t2` (`a` INT64 NOT NULL, `b` STRING DEFAULT ('q'\n), `s` STRUCT<`x y` INT64> DEFAULT (STRUCT(1)\n) NOT NULL); " +
 		"INSERT INTO `p.ds.t2` (`a`, `b`, `s`) SELECT `a`, `b`, `s` FROM `p.ds.tmp`; DROP TABLE `p.ds.tmp`"; got != want {
 		t.Errorf("FinishRebuildTableSQL =\n%s\nwant\n%s", got, want)
 	}
@@ -122,6 +122,15 @@ func TestRebuildTableSQL(t *testing.T) {
 	}
 	if want := "CREATE TABLE `p.ds.t2` AS SELECT * FROM `p.ds.tmp`; DROP TABLE `p.ds.tmp`"; got != want {
 		t.Errorf("FinishRebuildTableSQL without definitions =\n%s\nwant\n%s", got, want)
+	}
+
+	// A trailing line comment in a DEFAULT ends at the newline.
+	got, err = r.RestoreTableSpecSQL(src, []ColumnDefinition{{Name: "a", Type: "INT64", Default: "1 --", NotNull: true}, {Name: "b", Type: "STRING"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE IF NOT EXISTS `p.ds.t` (`a` INT64 DEFAULT (1 --\n) NOT NULL, `b` STRING)"; got != want {
+		t.Errorf("RestoreTableSpecSQL =\n%s\nwant\n%s", got, want)
 	}
 
 	if _, err := r.RebuildTableSQL(src, tmp, []ProjectedColumn{{Expr: "1", Name: "a`b"}}); err == nil {

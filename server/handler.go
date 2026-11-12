@@ -1902,6 +1902,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		// ALTER TABLE is atomic: discard what the failed rebuild did and
 		// record only the job.
 		_ = tx.RollbackIfNotCommitted()
+		alterPlan.repairCatalog(ctx, r.server)
 		syncResponse = nil
 		conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 		if err != nil {
@@ -2204,6 +2205,10 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 			} else {
 				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, alterPlan, ddl, queryErr)
 			}
+		}
+		if alterPlan != nil {
+			_ = tx.RollbackIfNotCommitted()
+			alterPlan.repairCatalog(ctx, r.server)
 		}
 		return nil, queryErr
 	}

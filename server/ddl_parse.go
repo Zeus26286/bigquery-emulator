@@ -81,8 +81,21 @@ type partitionSpec struct {
 	// unit is DAY, HOUR, MONTH or YEAR for time partitioning.
 	unit string
 	// column is the partitioning column; empty for ingestion time.
-	column               string
+	column string
+	// function is the upper-cased function applied to the column, e.g.
+	// DATE or TIMESTAMP_TRUNC; empty for the column itself.
+	function             string
 	start, end, interval int64
+}
+
+// partitionColumnTypes are the column types each time partitioning
+// function applies to.
+var partitionColumnTypes = map[string]string{
+	"":                "DATE",
+	"DATE":            "TIMESTAMP DATETIME",
+	"TIMESTAMP_TRUNC": "TIMESTAMP",
+	"DATETIME_TRUNC":  "DATETIME",
+	"DATE_TRUNC":      "DATE",
 }
 
 var ddlKeywordPattern = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\b`)
@@ -660,13 +673,15 @@ func parsePartitionBy(node *googlesql.ASTPartitionBy) (*partitionSpec, bool) {
 		if !ok {
 			return nil, false
 		}
-		return &partitionSpec{kind: "time", unit: "DAY", column: column}, true
+		return &partitionSpec{kind: "time", unit: "DAY", column: column, function: name}, true
 	case "TIMESTAMP_TRUNC", "DATETIME_TRUNC", "DATE_TRUNC":
 		if len(args) != 2 {
 			return nil, false
 		}
-		column, ok := timeColumn(args[0], "_PARTITIONTIME")
-		if !ok {
+		// The ingestion-time pseudo column each function applies to.
+		ingestion := map[string]string{"TIMESTAMP_TRUNC": "_PARTITIONTIME", "DATE_TRUNC": "_PARTITIONDATE"}[name]
+		column, ok := timeColumn(args[0], ingestion)
+		if !ok || column == "" && ingestion == "" {
 			return nil, false
 		}
 		unit, ok := singleName(args[1])
@@ -675,11 +690,16 @@ func parsePartitionBy(node *googlesql.ASTPartitionBy) (*partitionSpec, bool) {
 		}
 		unit = strings.ToUpper(unit)
 		switch unit {
-		case "HOUR", "DAY", "MONTH", "YEAR":
+		case "HOUR", "DAY":
+			// DATE_TRUNC partitions only by MONTH or YEAR.
+			if name == "DATE_TRUNC" {
+				return nil, false
+			}
+		case "MONTH", "YEAR":
 		default:
 			return nil, false
 		}
-		return &partitionSpec{kind: "time", unit: unit, column: column}, true
+		return &partitionSpec{kind: "time", unit: unit, column: column, function: name}, true
 	case "RANGE_BUCKET":
 		if len(args) != 2 {
 			return nil, false
@@ -711,6 +731,24 @@ func parsePartitionBy(node *googlesql.ASTPartitionBy) (*partitionSpec, bool) {
 		return spec, true
 	}
 	return nil, false
+}
+
+// partitionColumnTypeOK reports whether the partitioning applies to the
+// type of its column, e.g. TIMESTAMP_TRUNC to a TIMESTAMP column.
+func partitionColumnTypeOK(p *partitionSpec, field *bigqueryv2.TableFieldSchema) bool {
+	if field.Mode == "REPEATED" {
+		return false
+	}
+	typ := strings.ToUpper(field.Type)
+	if p.kind == "range" {
+		return typ == "INTEGER" || typ == "INT64"
+	}
+	for _, allowed := range strings.Fields(partitionColumnTypes[p.function]) {
+		if typ == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // parseClusterBy returns the clustering columns, or nil when one of them is
@@ -824,10 +862,14 @@ func (c *createTableDDL) apply(ctx context.Context, table *bigqueryv2.Table) {
 			column := ""
 			if p.column != "" {
 				field := findField(p.column)
-				if field == nil {
+				switch {
+				case field == nil:
 					warn("partitioning column is not in the schema", p.column)
 					p = nil
-				} else {
+				case !partitionColumnTypeOK(p, field):
+					warn("PARTITION BY expression does not apply to the type of the partitioning column and is not recorded in the table metadata", p.column)
+					p = nil
+				default:
 					column = field.Name
 				}
 			}

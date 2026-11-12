@@ -71,6 +71,11 @@ type alterTablePlan struct {
 	// An empty sql means that no rebuild is needed: the statement succeeds
 	// without running anything, and only the metadata changes.
 	sql string
+	// ranFirstStep is set once the first step of the rebuild ran, and
+	// srcSpec is the spec googlesqlite reported for the dropped table. A
+	// rolled-back rebuild needs repairCatalog from then on.
+	ranFirstStep bool
+	srcSpec      *googlesqlite.TableSpec
 }
 
 type alterColumn struct {
@@ -93,6 +98,9 @@ type alterColumn struct {
 	// expression) and DROP DEFAULT (defaultText is empty).
 	defaultSet  bool
 	defaultText string
+	// keepDefault is set when the defaultValueExpression of oldField was
+	// checked by checkDefaults and can be given to the rebuilt table.
+	keepDefault bool
 }
 
 // columnAnnotation holds the OPTIONS(description=...), the NOT NULL and the
@@ -352,7 +360,8 @@ func (p *alterTablePlan) checkUnchanged(ctx context.Context, server *Server, tx 
 	tableName := fmt.Sprintf("%s:%s.%s", p.ref.ProjectId, p.ref.DatasetId, p.ref.TableId)
 	columns, err := server.contentRepo.TableColumnNames(ctx, tx, p.ref)
 	if err != nil {
-		return fmt.Errorf("table %s %w: %s", tableName, errAlterConcurrentModification, err)
+		// The error of googlesqlite may name the table by its internal name.
+		return fmt.Errorf("table %s %w: %s", tableName, errAlterConcurrentModification, translateQueryError(err, p.ref.ProjectId, nil))
 	}
 	same := len(columns) == len(p.sourceColumns)
 	for i := 0; same && i < len(columns); i++ {
@@ -440,7 +449,7 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 		if len(stmt.actions) != 1 {
 			return nil, fmt.Errorf("ALTER TABLE RENAME TO cannot be combined with other actions")
 		}
-		return planRenameTable(server, project, plan, content, stmt.actions[0].newPath)
+		return planRenameTable(ctx, server, project, plan, content, stmt.actions[0].newPath, defaultProjectID, defaultDatasetID)
 	}
 
 	isPartitioningColumn := func(name string) bool {
@@ -596,6 +605,9 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 						return nil, fmt.Errorf("ALTER TABLE SET OPTIONS: invalid value for option %s: %w", option.name, err)
 					}
 				}
+				if option.name == "partition_expiration_days" && option.value != nil && content.TimePartitioning == nil {
+					return nil, fmt.Errorf("ALTER TABLE SET OPTIONS: partition_expiration_days can only be set on a time-partitioned table; table %s is not time-partitioned", tableName)
+				}
 				// Validate the value now; the options are applied
 				// again to the metadata after the job committed.
 				if err := applyTableOption(&bigqueryv2.Table{TimePartitioning: &bigqueryv2.TimePartitioning{}}, option); err != nil {
@@ -720,6 +732,9 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 	if !rebuild {
 		return plan, nil
 	}
+	if err := plan.checkDefaults(ctx, server, defaultProjectID, defaultDatasetID); err != nil {
+		return nil, err
+	}
 	projection := make([]contentdata.ProjectedColumn, 0, len(columns))
 	for _, column := range columns {
 		projection = append(projection, contentdata.ProjectedColumn{Expr: column.expr, Name: column.name})
@@ -759,7 +774,7 @@ func (p *alterTablePlan) setRebuildSQL(server *Server, projection []contentdata.
 	return nil
 }
 
-func planRenameTable(server *Server, project *metadata.Project, plan *alterTablePlan, content *bigqueryv2.Table, newPath []string) (*alterTablePlan, error) {
+func planRenameTable(ctx context.Context, server *Server, project *metadata.Project, plan *alterTablePlan, content *bigqueryv2.Table, newPath []string, projectID, datasetID string) (*alterTablePlan, error) {
 	ref := plan.ref
 	var path []string
 	for _, part := range newPath {
@@ -788,6 +803,9 @@ func planRenameTable(server *Server, project *metadata.Project, plan *alterTable
 		plan.columns = append(plan.columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field, field: field})
 	}
 	plan.newRef = newRef
+	if err := plan.checkDefaults(ctx, server, projectID, datasetID); err != nil {
+		return nil, err
+	}
 	if err := plan.setRebuildSQL(server, projection); err != nil {
 		return nil, err
 	}
@@ -795,13 +813,45 @@ func planRenameTable(server *Server, project *metadata.Project, plan *alterTable
 	return plan, nil
 }
 
+// alterFinishHook, when set by a test, may rewrite the second step of a
+// rebuild, e.g. to make it fail after the first step ran.
+var alterFinishHook struct {
+	mu sync.Mutex
+	fn func(sql string) string
+}
+
+func setAlterFinishHook(fn func(sql string) string) {
+	alterFinishHook.mu.Lock()
+	defer alterFinishHook.mu.Unlock()
+	alterFinishHook.fn = fn
+}
+
+func runAlterFinishHook(sql string) string {
+	alterFinishHook.mu.Lock()
+	hook := alterFinishHook.fn
+	alterFinishHook.mu.Unlock()
+	if hook == nil {
+		return sql
+	}
+	return hook(sql)
+}
+
 // run runs the rebuild of the plan inside tx. The first step copies the rows
 // into the temporary table and drops the table. googlesqlite reports the
 // dropped table's spec, with the NOT NULL and DEFAULT constraints it applies,
 // from which the second step creates the final table with the same
 // constraints and copies the rows back.
+//
+// Everything that can be checked is checked while planning, since a failure
+// after the first step leaves googlesqlite's in-memory catalog without the
+// table when the transaction is rolled back (goccy/googlesqlite#104); the
+// caller must then call repairCatalog.
 func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection.Tx, projectID, datasetID string, params []*bigqueryv2.QueryParameter) (*internaltypes.QueryResponse, error) {
+	p.ranFirstStep = true
 	first, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, p.sql, params)
+	if first != nil && first.ChangedCatalog != nil && first.ChangedCatalog.Table != nil {
+		p.srcSpec = findTableSpec(first.ChangedCatalog.Table.Deleted, p.ref)
+	}
 	if err != nil {
 		return first, err
 	}
@@ -809,7 +859,7 @@ func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection
 	if err != nil {
 		return nil, err
 	}
-	second, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, finish, params)
+	second, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, runAlterFinishHook(finish), params)
 	if err != nil {
 		return second, err
 	}
@@ -827,26 +877,58 @@ func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection
 // googlesqlite applies one; its expression is the defaultValueExpression of
 // the metadata, since googlesqlite stores only its internal form.
 func (p *alterTablePlan) finishSQL(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog) (string, error) {
-	var src, tmp *googlesqlite.TableSpec
+	var tmp *googlesqlite.TableSpec
 	if cat != nil && cat.Table != nil {
-		src = findTableSpec(cat.Table.Deleted, p.ref)
 		tmp = findTableSpec(append(append([]*googlesqlite.TableSpec{}, cat.Table.Added...), cat.Table.Updated...), p.tmpRef)
 	}
 	if tmp == nil || len(tmp.Columns) != len(p.columns) {
 		return "", fmt.Errorf("columns of the rebuilt table %s are unknown", p.ref.TableId)
 	}
-	defs := make([]contentdata.ColumnDefinition, 0, len(p.columns))
-	typesKnown := true
-	needsDefs := false
-	for i, column := range p.columns {
-		def := contentdata.ColumnDefinition{Name: column.name}
-		if typ, ok := contentdata.FieldDDLType(types.TableFieldSchemaFromColumnType(column.name, tmp.Columns[i].Type)); ok {
-			def.Type = typ
+	columnTypes := make([]*googlesqlite.ColumnType, 0, len(tmp.Columns))
+	for _, c := range tmp.Columns {
+		columnTypes = append(columnTypes, c.Type)
+	}
+	defs, ok := p.columnDefinitions(ctx, columnTypes, p.srcSpec, true)
+	if !ok {
+		// CREATE TABLE ... AS SELECT copies any column type, but drops the
+		// constraints.
+		logger.Logger(ctx).Warn("ALTER TABLE drops the NOT NULL and DEFAULT constraints of a table: the emulator cannot express the type of one of its columns",
+			zap.String("table", p.ref.TableId))
+		defs = nil
+	}
+	return server.contentRepo.FinishRebuildTableSQL(p.tmpRef, p.dstRef(), defs)
+}
+
+// columnDefinitions returns the definitions of the columns of the plan, of
+// the given types, with the constraints src reports. after selects the
+// columns after the statement; otherwise they are the columns of the table
+// before it, for repairCatalog. It reports false when a type cannot be
+// expressed.
+func (p *alterTablePlan) columnDefinitions(ctx context.Context, columnTypes []*googlesqlite.ColumnType, src *googlesqlite.TableSpec, after bool) ([]contentdata.ColumnDefinition, bool) {
+	defs := make([]contentdata.ColumnDefinition, 0, len(columnTypes))
+	for i, columnType := range columnTypes {
+		var column *alterColumn
+		var name string
+		if after {
+			column = p.columns[i]
+			name = column.name
 		} else {
-			typesKnown = false
+			name = src.Columns[i].Name
+			for _, c := range p.columns {
+				if c.oldField != nil && strings.EqualFold(c.oldField.Name, name) {
+					column = c
+					break
+				}
+			}
 		}
+		def := contentdata.ColumnDefinition{Name: name}
+		typ, ok := contentdata.FieldDDLType(types.TableFieldSchemaFromColumnType(name, columnType))
+		if !ok {
+			return nil, false
+		}
+		def.Type = typ
 		var srcColumn *googlesqlite.ColumnSpec
-		if column.oldField != nil && src != nil {
+		if column != nil && column.oldField != nil && src != nil {
 			for _, c := range src.Columns {
 				if strings.EqualFold(c.Name, column.oldField.Name) {
 					srcColumn = c
@@ -854,37 +936,193 @@ func (p *alterTablePlan) finishSQL(ctx context.Context, server *Server, cat *goo
 				}
 			}
 		}
-		if srcColumn != nil && srcColumn.IsNotNull && !column.dropNotNull {
+		if srcColumn != nil && srcColumn.IsNotNull && (!after || !column.dropNotNull) {
 			def.NotNull = true
 		}
 		switch {
-		case column.defaultSet:
+		case after && column.defaultSet:
 			def.Default = column.defaultText
 		case srcColumn != nil && srcColumn.DefaultExpr != "":
-			if column.oldField.DefaultValueExpression != "" {
+			if column.keepDefault {
 				def.Default = column.oldField.DefaultValueExpression
-			} else {
-				logger.Logger(ctx).Warn("the DEFAULT of a column is dropped by ALTER TABLE: its expression is not in the table metadata",
-					zap.String("table", p.ref.TableId), zap.String("column", column.name))
+			} else if after {
+				logger.Logger(ctx).Warn("the DEFAULT of a column is dropped by ALTER TABLE: the table metadata has no valid expression for it",
+					zap.String("table", p.ref.TableId), zap.String("column", name))
 			}
 		}
-		if def.Default != "" {
-			if err := validateDefaultExpression(def.Default); err != nil {
-				return "", fmt.Errorf("invalid default value expression for column %s: %w", column.name, err)
-			}
-		}
-		needsDefs = needsDefs || def.NotNull || def.Default != ""
 		defs = append(defs, def)
 	}
-	if !typesKnown {
-		if needsDefs {
-			return "", fmt.Errorf("ALTER TABLE cannot keep the NOT NULL or DEFAULT constraints of table %s: the emulator cannot express the type of one of its columns", p.ref.TableId)
+	return defs, true
+}
+
+// checkDefaults checks, before anything runs, the DEFAULT expressions the
+// rebuild may give to the columns: a SET DEFAULT of the statement, which
+// fails the statement if it is invalid, and the defaultValueExpression of
+// the metadata, which is dropped with a warning if it is invalid (it can
+// come from the tables.insert and tables.patch input).
+func (p *alterTablePlan) checkDefaults(ctx context.Context, server *Server, projectID, datasetID string) error {
+	for _, column := range p.columns {
+		if column.oldField == nil {
+			continue
 		}
-		// Without constraints to keep, CREATE TABLE ... AS SELECT
-		// copies any column type.
-		defs = nil
+		var typ string
+		if column.newType != nil {
+			typ = column.newType.name
+		} else if t, ok := contentdata.FieldDDLType(column.field); ok {
+			typ = t
+		}
+		if column.defaultSet {
+			if column.defaultText == "" {
+				continue
+			}
+			if typ == "" {
+				return fmt.Errorf("ALTER TABLE ALTER COLUMN SET DEFAULT is not supported by the emulator for column %s of type %s", column.name, column.field.Type)
+			}
+			if err := checkDefaultExpr(ctx, server, projectID, datasetID, column.name, typ, column.defaultText); err != nil {
+				return err
+			}
+			continue
+		}
+		text := column.oldField.DefaultValueExpression
+		if text == "" || typ == "" {
+			continue
+		}
+		if err := checkDefaultExpr(ctx, server, projectID, datasetID, column.name, typ, text); err != nil {
+			logger.Logger(ctx).Warn("invalid defaultValueExpression in the table metadata",
+				zap.String("table", p.ref.TableId), zap.String("column", column.name), zap.Error(err))
+			continue
+		}
+		column.keepDefault = true
 	}
-	return server.contentRepo.FinishRebuildTableSQL(p.tmpRef, p.dstRef(), defs)
+	return nil
+}
+
+// checkDefaultExpr checks that text is an expression that can be the
+// DEFAULT of a column of type typ: an expression whose type can be assigned
+// to the column. It runs read-only queries on a transaction of its own.
+func checkDefaultExpr(ctx context.Context, server *Server, projectID, datasetID, column, typ, text string) error {
+	if err := validateDefaultExpression(text); err != nil {
+		return fmt.Errorf("Invalid default value expression for column %s: %w", column, err)
+	}
+	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	// The closing parenthesis is on a line of its own, so that a trailing
+	// line comment cannot comment it out.
+	response, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT (%s\n) AS v", text), nil)
+	if err != nil {
+		return fmt.Errorf("Invalid default value expression for column %s: %w", column, translateQueryError(err, projectID, nil))
+	}
+	exprType := "unknown"
+	if len(response.Schema.Fields) == 1 {
+		if t, ok := contentdata.FieldDDLType(response.Schema.Fields[0]); ok {
+			exprType = t
+		}
+	}
+	notAssignable := fmt.Errorf("Invalid default value expression for column %s: an expression of type %s cannot be assigned to a column of type %s", column, exprType, typ)
+	// The elements of an array literal take their common supertype; the
+	// expression is assignable when that type is the column's type.
+	// Literals are coerced, e.g. '2024-01-01' to a DATE column.
+	response, err = server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT [CAST(NULL AS %s), (%s\n)] AS v", typ, text), nil)
+	if err != nil || len(response.Schema.Fields) != 1 {
+		return notAssignable
+	}
+	element := *response.Schema.Fields[0]
+	element.Mode = ""
+	if got, ok := contentdata.FieldDDLType(&element); !ok || got != typ {
+		return notAssignable
+	}
+	return nil
+}
+
+// repairCatalog brings googlesqlite's in-memory catalog back in line with
+// the tables after a rebuild whose first step ran was rolled back: the
+// rollback restores SQLite and the stored specs, but not the in-memory
+// catalog, which still misses the table and knows the temporary table
+// (goccy/googlesqlite#104). Failures are logged: the statement already
+// failed with its own error.
+//
+// TODO(googlesqlite): roll back the in-memory catalog with the transaction
+// (goccy/googlesqlite#104). Remove this once it does.
+func (p *alterTablePlan) repairCatalog(ctx context.Context, server *Server) {
+	if p == nil || !p.ranFirstStep {
+		return
+	}
+	if err := p.restoreCatalog(ctx, server); err != nil {
+		logger.Logger(ctx).Error("failed to repair the analyzer catalog after a failed ALTER TABLE",
+			zap.String("table", p.ref.TableId), zap.Error(err))
+	}
+}
+
+func (p *alterTablePlan) restoreCatalog(ctx context.Context, server *Server) error {
+	project, err := server.metaRepo.FindProject(ctx, p.ref.ProjectId)
+	if err != nil {
+		return err
+	}
+	if project == nil || project.Dataset(p.ref.DatasetId) == nil || project.Dataset(p.ref.DatasetId).Table(p.ref.TableId) == nil {
+		return fmt.Errorf("metadata of the table is not found")
+	}
+	content, err := project.Dataset(p.ref.DatasetId).Table(p.ref.TableId).Content()
+	if err != nil {
+		return err
+	}
+	conn, err := server.connMgr.Connection(ctx, p.ref.ProjectId, p.ref.DatasetId)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	// Forget the tables the rolled-back rebuild created. Their SQLite
+	// tables are gone, so this only drops their specs.
+	for _, ref := range []*bigqueryv2.TableReference{p.tmpRef, p.newRef} {
+		if ref == nil {
+			continue
+		}
+		path, err := server.contentRepo.TablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+		if err != nil {
+			return err
+		}
+		if _, err := server.contentRepo.Query(ctx, tx, ref.ProjectId, ref.DatasetId, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", path), nil); err != nil {
+			return err
+		}
+	}
+	// Register the table again, with its constraints when googlesqlite
+	// reported them.
+	restored := false
+	if src := p.srcSpec; src != nil {
+		columnTypes := make([]*googlesqlite.ColumnType, 0, len(src.Columns))
+		for _, c := range src.Columns {
+			columnTypes = append(columnTypes, c.Type)
+		}
+		if defs, ok := p.columnDefinitions(ctx, columnTypes, src, false); ok && len(defs) != 0 {
+			sql, err := server.contentRepo.RestoreTableSpecSQL(p.ref, defs)
+			if err != nil {
+				return err
+			}
+			if _, err := server.contentRepo.Query(ctx, tx, p.ref.ProjectId, p.ref.DatasetId, sql, nil); err != nil {
+				return err
+			}
+			restored = true
+		}
+	}
+	if !restored {
+		if err := server.contentRepo.RestoreTableSpec(ctx, tx, content); err != nil {
+			return err
+		}
+	}
+	if err := server.contentRepo.RefreshCatalog(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // validateDefaultExpression checks that text is a single expression before
@@ -902,7 +1140,27 @@ func validateDefaultExpression(text string) error {
 	if out == nil {
 		return fmt.Errorf("not an expression")
 	}
+	expr, err := out.Expression()
+	if err != nil || expr == nil {
+		return fmt.Errorf("not an expression")
+	}
+	if containsSubquery(expr) {
+		return fmt.Errorf("a subquery is not allowed in a default value expression")
+	}
 	return nil
+}
+
+func containsSubquery(node googlesql.ASTNode) bool {
+	switch node.(type) {
+	case *googlesql.ASTExpressionSubquery, *googlesql.ASTQuery:
+		return true
+	}
+	for _, child := range childNodes(node) {
+		if containsSubquery(child) {
+			return true
+		}
+	}
+	return false
 }
 
 func findTableSpec(specs []*googlesqlite.TableSpec, ref *bigqueryv2.TableReference) *googlesqlite.TableSpec {
