@@ -71,11 +71,14 @@ type alterTablePlan struct {
 	// An empty sql means that no rebuild is needed: the statement succeeds
 	// without running anything, and only the metadata changes.
 	sql string
-	// ranFirstStep is set once the first step of the rebuild ran, and
-	// srcSpec is the spec googlesqlite reported for the dropped table. A
-	// rolled-back rebuild needs repairCatalog from then on.
-	ranFirstStep bool
-	srcSpec      *googlesqlite.TableSpec
+	// What the steps of a rebuild changed in googlesqlite's catalog, which
+	// repairCatalog undoes when the rebuild is rolled back: srcSpec is the
+	// spec of the table the first step dropped, tmpAdded is set when it
+	// created the temporary table, and newRefAdded when the second step
+	// created the table of RENAME TO.
+	srcSpec     *googlesqlite.TableSpec
+	tmpAdded    bool
+	newRefAdded bool
 }
 
 type alterColumn struct {
@@ -800,7 +803,11 @@ func planRenameTable(ctx context.Context, server *Server, project *metadata.Proj
 	projection := make([]contentdata.ProjectedColumn, 0, len(content.Schema.Fields))
 	for _, field := range content.Schema.Fields {
 		projection = append(projection, contentdata.ProjectedColumn{Expr: quoteIdent(field.Name), Name: field.Name})
-		plan.columns = append(plan.columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field, field: field})
+		copied, err := copyFieldSchema(field)
+		if err != nil {
+			return nil, err
+		}
+		plan.columns = append(plan.columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field, field: copied})
 	}
 	plan.newRef = newRef
 	if err := plan.checkDefaults(ctx, server, projectID, datasetID); err != nil {
@@ -847,10 +854,11 @@ func runAlterFinishHook(sql string) string {
 // table when the transaction is rolled back (goccy/googlesqlite#104); the
 // caller must then call repairCatalog.
 func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection.Tx, projectID, datasetID string, params []*bigqueryv2.QueryParameter) (*internaltypes.QueryResponse, error) {
-	p.ranFirstStep = true
 	first, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, p.sql, params)
 	if first != nil && first.ChangedCatalog != nil && first.ChangedCatalog.Table != nil {
-		p.srcSpec = findTableSpec(first.ChangedCatalog.Table.Deleted, p.ref)
+		changed := first.ChangedCatalog.Table
+		p.srcSpec = findTableSpec(changed.Deleted, p.ref)
+		p.tmpAdded = findTableSpec(append(append([]*googlesqlite.TableSpec{}, changed.Added...), changed.Updated...), p.tmpRef) != nil
 	}
 	if err != nil {
 		return first, err
@@ -860,6 +868,10 @@ func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection
 		return nil, err
 	}
 	second, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, runAlterFinishHook(finish), params)
+	if p.newRef != nil && second != nil && second.ChangedCatalog != nil && second.ChangedCatalog.Table != nil {
+		changed := second.ChangedCatalog.Table
+		p.newRefAdded = findTableSpec(append(append([]*googlesqlite.TableSpec{}, changed.Added...), changed.Updated...), p.newRef) != nil
+	}
 	if err != nil {
 		return second, err
 	}
@@ -988,8 +1000,11 @@ func (p *alterTablePlan) checkDefaults(ctx context.Context, server *Server, proj
 			continue
 		}
 		if err := checkDefaultExpr(ctx, server, projectID, datasetID, column.name, typ, text); err != nil {
-			logger.Logger(ctx).Warn("invalid defaultValueExpression in the table metadata",
+			// The rebuilt table has no such DEFAULT, so the metadata
+			// stops advertising it.
+			logger.Logger(ctx).Warn("invalid defaultValueExpression in the table metadata is removed by ALTER TABLE",
 				zap.String("table", p.ref.TableId), zap.String("column", column.name), zap.Error(err))
+			column.field.DefaultValueExpression = ""
 			continue
 		}
 		column.keepDefault = true
@@ -1013,9 +1028,12 @@ func checkDefaultExpr(ctx context.Context, server *Server, projectID, datasetID,
 		return err
 	}
 	defer tx.RollbackIfNotCommitted()
-	// The closing parenthesis is on a line of its own, so that a trailing
-	// line comment cannot comment it out.
-	response, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT (%s\n) AS v", text), nil)
+	// The queries only analyze the expression: LIMIT 0 and IF(FALSE, ...)
+	// keep it from being evaluated, so that e.g. DEFAULT ERROR('x') is
+	// accepted as in BigQuery, which fails only the INSERT. The closing
+	// parenthesis is on a line of its own, so that a trailing line comment
+	// cannot comment it out.
+	response, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT (%s\n) AS v LIMIT 0", text), nil)
 	if err != nil {
 		return fmt.Errorf("Invalid default value expression for column %s: %w", column, translateQueryError(err, projectID, nil))
 	}
@@ -1026,32 +1044,31 @@ func checkDefaultExpr(ctx context.Context, server *Server, projectID, datasetID,
 		}
 	}
 	notAssignable := fmt.Errorf("Invalid default value expression for column %s: an expression of type %s cannot be assigned to a column of type %s", column, exprType, typ)
-	// The elements of an array literal take their common supertype; the
-	// expression is assignable when that type is the column's type.
-	// Literals are coerced, e.g. '2024-01-01' to a DATE column.
-	response, err = server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT [CAST(NULL AS %s), (%s\n)] AS v", typ, text), nil)
+	// IF takes the common supertype of its branches; the expression is
+	// assignable when that type is the column's type. Literals are
+	// coerced, e.g. '2024-01-01' to a DATE column.
+	response, err = server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT IF(FALSE, CAST(NULL AS %s), (%s\n)) AS v LIMIT 0", typ, text), nil)
 	if err != nil || len(response.Schema.Fields) != 1 {
 		return notAssignable
 	}
-	element := *response.Schema.Fields[0]
-	element.Mode = ""
-	if got, ok := contentdata.FieldDDLType(&element); !ok || got != typ {
+	if got, ok := contentdata.FieldDDLType(response.Schema.Fields[0]); !ok || got != typ {
 		return notAssignable
 	}
 	return nil
 }
 
 // repairCatalog brings googlesqlite's in-memory catalog back in line with
-// the tables after a rebuild whose first step ran was rolled back: the
-// rollback restores SQLite and the stored specs, but not the in-memory
-// catalog, which still misses the table and knows the temporary table
-// (goccy/googlesqlite#104). Failures are logged: the statement already
-// failed with its own error.
+// the tables after a rebuild was rolled back: the rollback restores SQLite
+// and the stored specs, but not the in-memory catalog (goccy/googlesqlite#104).
+// It undoes only what the steps of the rebuild reported: a step that failed
+// before changing the catalog left it correct, and rewriting a spec then
+// would lose constraints. Failures are logged: the statement already failed
+// with its own error.
 //
 // TODO(googlesqlite): roll back the in-memory catalog with the transaction
 // (goccy/googlesqlite#104). Remove this once it does.
 func (p *alterTablePlan) repairCatalog(ctx context.Context, server *Server) {
-	if p == nil || !p.ranFirstStep {
+	if p == nil || p.srcSpec == nil && !p.tmpAdded && !p.newRefAdded {
 		return
 	}
 	if err := p.restoreCatalog(ctx, server); err != nil {
@@ -1061,17 +1078,6 @@ func (p *alterTablePlan) repairCatalog(ctx context.Context, server *Server) {
 }
 
 func (p *alterTablePlan) restoreCatalog(ctx context.Context, server *Server) error {
-	project, err := server.metaRepo.FindProject(ctx, p.ref.ProjectId)
-	if err != nil {
-		return err
-	}
-	if project == nil || project.Dataset(p.ref.DatasetId) == nil || project.Dataset(p.ref.DatasetId).Table(p.ref.TableId) == nil {
-		return fmt.Errorf("metadata of the table is not found")
-	}
-	content, err := project.Dataset(p.ref.DatasetId).Table(p.ref.TableId).Content()
-	if err != nil {
-		return err
-	}
 	conn, err := server.connMgr.Connection(ctx, p.ref.ProjectId, p.ref.DatasetId)
 	if err != nil {
 		return err
@@ -1083,10 +1089,14 @@ func (p *alterTablePlan) restoreCatalog(ctx context.Context, server *Server) err
 	defer tx.RollbackIfNotCommitted()
 	// Forget the tables the rolled-back rebuild created. Their SQLite
 	// tables are gone, so this only drops their specs.
-	for _, ref := range []*bigqueryv2.TableReference{p.tmpRef, p.newRef} {
-		if ref == nil {
-			continue
-		}
+	var created []*bigqueryv2.TableReference
+	if p.tmpAdded {
+		created = append(created, p.tmpRef)
+	}
+	if p.newRefAdded {
+		created = append(created, p.newRef)
+	}
+	for _, ref := range created {
 		path, err := server.contentRepo.TablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
 		if err != nil {
 			return err
@@ -1095,27 +1105,22 @@ func (p *alterTablePlan) restoreCatalog(ctx context.Context, server *Server) err
 			return err
 		}
 	}
-	// Register the table again, with its constraints when googlesqlite
-	// reported them.
-	restored := false
+	// Register the dropped table again, with the constraints googlesqlite
+	// reported for it.
 	if src := p.srcSpec; src != nil {
 		columnTypes := make([]*googlesqlite.ColumnType, 0, len(src.Columns))
 		for _, c := range src.Columns {
 			columnTypes = append(columnTypes, c.Type)
 		}
-		if defs, ok := p.columnDefinitions(ctx, columnTypes, src, false); ok && len(defs) != 0 {
-			sql, err := server.contentRepo.RestoreTableSpecSQL(p.ref, defs)
-			if err != nil {
-				return err
-			}
-			if _, err := server.contentRepo.Query(ctx, tx, p.ref.ProjectId, p.ref.DatasetId, sql, nil); err != nil {
-				return err
-			}
-			restored = true
+		defs, ok := p.columnDefinitions(ctx, columnTypes, src, false)
+		if !ok || len(defs) == 0 {
+			return fmt.Errorf("the emulator cannot express the columns of the table")
 		}
-	}
-	if !restored {
-		if err := server.contentRepo.RestoreTableSpec(ctx, tx, content); err != nil {
+		sql, err := server.contentRepo.RestoreTableSpecSQL(p.ref, defs)
+		if err != nil {
+			return err
+		}
+		if _, err := server.contentRepo.Query(ctx, tx, p.ref.ProjectId, p.ref.DatasetId, sql, nil); err != nil {
 			return err
 		}
 	}
@@ -1255,6 +1260,12 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 			ProjectId: p.newRef.ProjectId,
 			DatasetId: p.newRef.DatasetId,
 			TableId:   p.newRef.TableId,
+		}
+		// checkDefaults may have removed an invalid default.
+		if content.Schema != nil && len(content.Schema.Fields) == len(p.columns) {
+			for i, field := range content.Schema.Fields {
+				field.DefaultValueExpression = p.columns[i].field.DefaultValueExpression
+			}
 		}
 		if err := dataset.DeleteTable(ctx, tx.Tx(), p.ref.TableId); err != nil {
 			return err

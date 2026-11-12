@@ -477,6 +477,78 @@ func TestAlterRebuildFailureKeepsTable(t *testing.T) {
 		})
 	}
 
+	// A statement that fails while the first step is analyzed changes
+	// nothing in googlesqlite's catalog, so nothing is repaired either: a
+	// repair would have to rewrite the spec and could lose its constraints.
+	for _, mode := range []string{"jobs.insert", "jobs.query"} {
+		for i, typ := range []string{"STRING(0)", "NUMERIC(100, 2)", "ARRAY<ARRAY<INT64>>"} {
+			t.Run(fmt.Sprintf("first_step_fails_%d/%s", i, mode), func(t *testing.T) {
+				table := fmt.Sprintf("rbs_%d_%s", i, strings.ReplaceAll(mode, ".", "_"))
+				env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64 NOT NULL, b STRING DEFAULT 'q')")
+				env.mustExec(t, "INSERT INTO dataset1."+table+" (a, b) VALUES (1, 'x'), (2, 'y')")
+				if err := env.exec(mode, "ALTER TABLE dataset1."+table+" ADD COLUMN c "+typ); err == nil {
+					t.Fatal("ALTER: want an error")
+				}
+				check(t, table, 2)
+				// The constraints survive a later rebuild too.
+				if err := env.exec(mode, "ALTER TABLE dataset1."+table+" ADD COLUMN d INT64"); err != nil {
+					t.Fatalf("next ALTER: %v", err)
+				}
+				check(t, table, 3)
+			})
+		}
+	}
+
+	// RENAME TO a name that SQLite already uses (a table the metadata lost
+	// track of) fails in the second step without touching that table.
+	t.Run("rename_onto_untracked_table", func(t *testing.T) {
+		_ = env.exec("jobs.query", "CREATE TABLE dataset1.untracked (a INT64); INSERT INTO dataset1.untracked (a) VALUES (42); SELECT ERROR('boom'); SELECT 1")
+		env.mustExec(t, "CREATE TABLE dataset1.ren_src (b INT64)")
+		env.mustExec(t, "INSERT INTO dataset1.ren_src (b) VALUES (7)")
+		if err := env.exec("jobs.insert", "ALTER TABLE dataset1.ren_src RENAME TO untracked"); err == nil {
+			t.Skip("the metadata knows the table; nothing to check")
+		}
+		if rows, err := env.read("SELECT a FROM dataset1.untracked"); err != nil || len(rows) != 1 || rows[0][0] != int64(42) {
+			t.Fatalf("untracked: got %v, %v", rows, err)
+		}
+		if rows, err := env.read("SELECT b FROM dataset1.ren_src"); err != nil || len(rows) != 1 || rows[0][0] != int64(7) {
+			t.Fatalf("ren_src: got %v, %v", rows, err)
+		}
+	})
+
+	// DEFAULTs of every type are checked without being evaluated.
+	for _, mode := range []string{"jobs.insert", "jobs.query"} {
+		t.Run("default_types/"+mode, func(t *testing.T) {
+			table := "rbt_" + strings.ReplaceAll(mode, ".", "_")
+			env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64, arr ARRAY<INT64> DEFAULT [1, 2], ts TIMESTAMP, f FLOAT64, s STRING, e STRING)")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (a) VALUES (1)")
+			for _, sql := range []string{
+				"ALTER TABLE dataset1." + table + " ADD COLUMN c INT64",
+				"ALTER TABLE dataset1." + table + " ALTER COLUMN ts SET DEFAULT CURRENT_TIMESTAMP()",
+				"ALTER TABLE dataset1." + table + " ALTER COLUMN f SET DEFAULT RAND()",
+				"ALTER TABLE dataset1." + table + " ALTER COLUMN s SET DEFAULT GENERATE_UUID()",
+				"ALTER TABLE dataset1." + table + " ALTER COLUMN e SET DEFAULT ERROR('no default')",
+			} {
+				if err := env.exec(mode, sql); err != nil {
+					t.Fatalf("%s: %v", sql, err)
+				}
+			}
+			if err := env.exec(mode, "ALTER TABLE dataset1."+table+" ALTER COLUMN arr SET DEFAULT [3]"); err != nil {
+				t.Fatalf("SET DEFAULT [3]: %v", err)
+			}
+			if err := env.exec(mode, "INSERT INTO dataset1."+table+" (a, e) VALUES (2, 'e')"); err != nil {
+				t.Fatalf("INSERT: %v", err)
+			}
+			rows, err := env.read("SELECT arr, ts IS NOT NULL, f IS NOT NULL, s IS NOT NULL FROM dataset1." + table + " WHERE a = 2")
+			if err != nil || len(rows) != 1 || !reflect.DeepEqual(rows[0], []bigquery.Value{[]bigquery.Value{int64(3)}, true, true, true}) {
+				t.Fatalf("defaults: got %v, %v", rows, err)
+			}
+			if err := env.exec(mode, "INSERT INTO dataset1."+table+" (a) VALUES (3)"); err == nil || !strings.Contains(err.Error(), "no default") {
+				t.Fatalf("ERROR default: got %v", err)
+			}
+		})
+	}
+
 	// A defaultValueExpression of the metadata that is not a valid DEFAULT
 	// (tables.patch input) is dropped instead of failing the rebuild.
 	for i, expr := range []string{"1 --", "1 #", "(SELECT 1)", "1) NOT NULL, `zz` INT64 DEFAULT (2", "'abc'"} {
@@ -507,6 +579,18 @@ func TestAlterRebuildFailureKeepsTable(t *testing.T) {
 			}
 			if rows, err := env.read("SELECT * FROM dataset1." + table); err != nil || len(rows) != 2 || len(rows[0]) != 3 {
 				t.Fatalf("SELECT *: got %v, %v", rows, err)
+			}
+			// The metadata no longer advertises a dropped default.
+			md, err = tbl.Metadata(env.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if i < 2 {
+				want = expr
+			}
+			if got := md.Schema[0].DefaultValueExpression; got != want {
+				t.Fatalf("defaultValueExpression: got %q, want %q", got, want)
 			}
 		})
 	}
