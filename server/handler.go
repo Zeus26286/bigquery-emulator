@@ -1742,11 +1742,17 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		}
 		return nil, fmt.Errorf("unspecified job configuration query")
 	}
+	if job.JobReference != nil && job.JobReference.JobId != "" && r.project.Job(job.JobReference.JobId) != nil {
+		// Reject a job ID in use before anything runs: recording the job
+		// would fail only after its statements ran.
+		return nil, errDuplicate(fmt.Sprintf("Already Exists: Job %s:%s", r.project.ID, job.JobReference.JobId))
+	}
 	queryProjectID, datasetID := queryProjectAndDataset(job.Configuration.Query.DefaultDataset, r.project.ID)
 	startTime := time.Now()
 	queryText := job.Configuration.Query.Query
 	var (
 		alterPlan *alterTablePlan
+		likePlan  *createLikePlan
 		planErr   error
 	)
 	// Check the DDL before the job transaction starts: checkDatasets reads
@@ -1754,6 +1760,13 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	ddl, planErr := analyzeDDL(queryText, queryProjectID, datasetID)
 	if planErr == nil {
 		planErr = ddl.checkDatasets(ctx, r.server)
+	}
+	if planErr == nil && ddl != nil && ddl.like != nil {
+		// Like ALTER TABLE, CREATE TABLE ... LIKE is planned from the
+		// metadata before the job transaction starts, also for a dry run.
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+		likePlan, planErr = planCreateTableLike(ctx, r.server, queryProjectID, datasetID, ddl.like, job.Configuration.Query.QueryParameters)
 	}
 	if planErr == nil && !job.Configuration.DryRun && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
@@ -1774,6 +1787,18 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		return nil, fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer tx.RollbackIfNotCommitted()
+	// rewritePending is set while tx holds the uncommitted steps of an ALTER
+	// TABLE or CREATE TABLE ... LIKE. Any return before they are committed
+	// or rolled back must roll them back and repair googlesqlite's in-memory
+	// catalog, which keeps their changes (goccy/googlesqlite#104).
+	rewritePending := false
+	defer func() {
+		if rewritePending {
+			_ = tx.RollbackIfNotCommitted()
+			alterPlan.repairCatalog(ctx, r.server)
+			likePlan.repairCatalog(ctx, r.server)
+		}
+	}()
 	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
 	var (
 		response *internaltypes.QueryResponse
@@ -1788,7 +1813,15 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if jobErr = alterPlan.checkUnchanged(ctx, r.server, tx); jobErr != nil {
 			break
 		}
+		rewritePending = true
 		response, jobErr = alterPlan.run(ctx, r.server, tx, queryProjectID, datasetID, job.Configuration.Query.QueryParameters)
+		jobErr = translateQueryError(jobErr, queryProjectID, ddl)
+	case likePlan != nil && job.Configuration.DryRun:
+		response, jobErr = likePlan.dryRun(ctx, r.server, tx, queryProjectID, datasetID, job.Configuration.Query.QueryParameters)
+		jobErr = translateQueryError(jobErr, queryProjectID, ddl)
+	case likePlan != nil:
+		rewritePending = true
+		response, jobErr = likePlan.run(ctx, r.server, tx, queryProjectID, datasetID, job.Configuration.Query.QueryParameters)
 		jobErr = translateQueryError(jobErr, queryProjectID, ddl)
 	default:
 		// On error, response may carry the catalog changes of the
@@ -1898,11 +1931,13 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		TotalBytesProcessed: totalBytes,
 	}
 	syncResponse := response
-	if alterPlan != nil && alterPlan.sql != "" && jobErr != nil && !job.Configuration.DryRun {
-		// ALTER TABLE is atomic: discard what the failed rebuild did and
-		// record only the job.
+	if (alterPlan != nil && alterPlan.sql != "" || likePlan != nil) && jobErr != nil && !job.Configuration.DryRun {
+		// ALTER TABLE and CREATE TABLE ... LIKE are atomic: discard what
+		// the failed statement did and record only the job.
 		_ = tx.RollbackIfNotCommitted()
 		alterPlan.repairCatalog(ctx, r.server)
+		likePlan.repairCatalog(ctx, r.server)
+		rewritePending = false
 		syncResponse = nil
 		conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 		if err != nil {
@@ -1936,7 +1971,8 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, syncResponse, alterPlan, ddl, jobErr); err != nil {
+		rewritePending = false
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, syncResponse, rewritePlan(alterPlan, likePlan), ddl, jobErr); err != nil {
 			return nil, err
 		}
 	}
@@ -1955,15 +1991,16 @@ func emptyDDLResponse() *internaltypes.QueryResponse {
 // syncQueryCatalog updates the table metadata and googlesqlite's analyzer
 // catalog after a query committed. response may be a partial response of a
 // failed query (queryErr != nil); an error while syncing it is then only
-// logged, so that it does not hide the query's own error. ddl is the analysis
-// of the query's text, and params its parameters.
-func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID string, params []*bigqueryv2.QueryParameter, response *internaltypes.QueryResponse, plan *alterTablePlan, ddl *ddlInfo, queryErr error) error {
+// logged, so that it does not hide the query's own error. plan is the DDL
+// statement the emulator ran itself, or nil. ddl is the analysis of the
+// query's text, and params its parameters.
+func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID string, params []*bigqueryv2.QueryParameter, response *internaltypes.QueryResponse, plan ddlRewritePlan, ddl *ddlInfo, queryErr error) error {
 	if response == nil {
 		return nil
 	}
 	var skip skipTableFunc
-	if plan != nil && plan.sql != "" {
-		skip = plan.skips
+	if plan != nil {
+		skip = plan.syncSkip()
 	}
 	if cat := response.ChangedCatalog; ddl != nil && cat != nil && cat.Table != nil && len(cat.Table.Added)+len(cat.Table.Updated) != 0 {
 		// The job committed, so the evaluation can use the database.
@@ -1972,8 +2009,8 @@ func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID 
 		}
 	}
 	res, err := syncCatalog(ctx, server, response.ChangedCatalog, skip, ddl)
-	if err == nil && plan != nil && plan.changed && queryErr == nil {
-		err = plan.applyMetadata(ctx, server, response.ChangedCatalog)
+	if err == nil && plan != nil && queryErr == nil {
+		err = plan.applyMetadataAfterCommit(ctx, server, response.ChangedCatalog)
 	}
 	if err != nil {
 		if queryErr == nil {
@@ -2138,6 +2175,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	queryText := r.queryRequest.Query
 	var (
 		alterPlan *alterTablePlan
+		likePlan  *createLikePlan
 		planErr   error
 	)
 	// Check the DDL before the transaction starts: checkDatasets reads the
@@ -2145,6 +2183,13 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	ddl, planErr := analyzeDDL(queryText, queryProjectID, datasetID)
 	if planErr == nil {
 		planErr = ddl.checkDatasets(ctx, r.server)
+	}
+	if planErr == nil && ddl != nil && ddl.like != nil {
+		// Like ALTER TABLE, CREATE TABLE ... LIKE is planned from the
+		// metadata before the transaction starts, also for a dry run.
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+		likePlan, planErr = planCreateTableLike(ctx, r.server, queryProjectID, datasetID, ddl.like, r.queryRequest.QueryParameters)
 	}
 	if planErr == nil && !r.queryRequest.DryRun && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
@@ -2165,6 +2210,18 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		return nil, err
 	}
 	defer tx.RollbackIfNotCommitted()
+	// rewritePending is set while tx holds the uncommitted steps of an ALTER
+	// TABLE or CREATE TABLE ... LIKE. Any return before they are committed
+	// or rolled back must roll them back and repair googlesqlite's in-memory
+	// catalog, which keeps their changes (goccy/googlesqlite#104).
+	rewritePending := false
+	defer func() {
+		if rewritePending {
+			_ = tx.RollbackIfNotCommitted()
+			alterPlan.repairCatalog(ctx, r.server)
+			likePlan.repairCatalog(ctx, r.server)
+		}
+	}()
 	var (
 		response *internaltypes.QueryResponse
 		queryErr error
@@ -2180,7 +2237,15 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if queryErr = alterPlan.checkUnchanged(ctx, r.server, tx); queryErr != nil {
 			break
 		}
+		rewritePending = true
 		response, queryErr = alterPlan.run(ctx, r.server, tx, queryProjectID, datasetID, r.queryRequest.QueryParameters)
+		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
+	case likePlan != nil && r.queryRequest.DryRun:
+		response, queryErr = likePlan.dryRun(ctx, r.server, tx, queryProjectID, datasetID, r.queryRequest.QueryParameters)
+		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
+	case likePlan != nil:
+		rewritePending = true
+		response, queryErr = likePlan.run(ctx, r.server, tx, queryProjectID, datasetID, r.queryRequest.QueryParameters)
 		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
 	default:
 		response, queryErr = r.server.contentRepo.Query(
@@ -2197,18 +2262,21 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		// Keep what the statements before the failure did, as jobs.insert
 		// and BigQuery do. Rolling back would also leave googlesqlite's
 		// in-memory catalog ahead of the tables (goccy/googlesqlite#104).
-		// A failed ALTER TABLE is rolled back instead, since ALTER TABLE
-		// is atomic; a rejected plan has nothing to roll back.
-		if !r.queryRequest.DryRun && alterPlan == nil && planErr == nil {
+		// A failed ALTER TABLE or CREATE TABLE ... LIKE is rolled back
+		// instead, since they are atomic; a rejected plan has nothing to
+		// roll back.
+		if !r.queryRequest.DryRun && alterPlan == nil && likePlan == nil && planErr == nil {
 			if err := tx.Commit(); err != nil {
 				logger.Logger(ctx).Error("failed to commit a failed query", zap.Error(err))
 			} else {
-				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, alterPlan, ddl, queryErr)
+				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, nil, ddl, queryErr)
 			}
 		}
-		if alterPlan != nil {
+		if alterPlan != nil || likePlan != nil {
 			_ = tx.RollbackIfNotCommitted()
 			alterPlan.repairCatalog(ctx, r.server)
+			likePlan.repairCatalog(ctx, r.server)
+			rewritePending = false
 		}
 		return nil, queryErr
 	}
@@ -2294,7 +2362,8 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, alterPlan, ddl, nil); err != nil {
+		rewritePending = false
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, rewritePlan(alterPlan, likePlan), ddl, nil); err != nil {
 			return nil, err
 		}
 	}

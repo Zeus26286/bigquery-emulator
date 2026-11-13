@@ -335,6 +335,73 @@ func (r *Repository) RestoreTableSpecSQL(ref *bigqueryv2.TableReference, columns
 	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (%s)", path, defs), nil
 }
 
+// CreateTableSQL returns a CREATE TABLE statement for ref with the given
+// column definitions.
+func (r *Repository) CreateTableSQL(ref *bigqueryv2.TableReference, columns []ColumnDefinition) (string, error) {
+	path, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+	if err != nil {
+		return "", err
+	}
+	if len(columns) == 0 {
+		return "", fmt.Errorf("a table needs at least one column")
+	}
+	defs, _, err := columnDefinitions(columns)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("CREATE TABLE `%s` (%s)", path, defs), nil
+}
+
+// CreateTableAsQuerySQL returns a CREATE TABLE ... AS SELECT statement that
+// stores the rows of query, a single query statement, in ref. The closing
+// parenthesis is on a line of its own, so that a trailing line comment in
+// query cannot comment it out.
+func (r *Repository) CreateTableAsQuerySQL(ref *bigqueryv2.TableReference, query string) (string, error) {
+	path, err := r.tablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("CREATE TABLE `%s` AS SELECT * FROM (\n%s\n)", path, query), nil
+}
+
+// InsertFromTableSQL returns a script that copies the columns srcColumns of
+// src into the columns dstColumns of dst, in order, and drops src.
+func (r *Repository) InsertFromTableSQL(src, dst *bigqueryv2.TableReference, srcColumns, dstColumns []string) (string, error) {
+	if len(srcColumns) == 0 || len(srcColumns) != len(dstColumns) {
+		return "", fmt.Errorf("the columns of tables %s and %s do not match", src.TableId, dst.TableId)
+	}
+	srcPath, err := r.tablePath(src.ProjectId, src.DatasetId, src.TableId)
+	if err != nil {
+		return "", err
+	}
+	dstPath, err := r.tablePath(dst.ProjectId, dst.DatasetId, dst.TableId)
+	if err != nil {
+		return "", err
+	}
+	quote := func(names []string) (string, error) {
+		quoted := make([]string, 0, len(names))
+		for _, name := range names {
+			if err := validateIdent("column", name); err != nil {
+				return "", err
+			}
+			quoted = append(quoted, fmt.Sprintf("`%s`", escapeIdent(name)))
+		}
+		return strings.Join(quoted, ", "), nil
+	}
+	srcList, err := quote(srcColumns)
+	if err != nil {
+		return "", err
+	}
+	dstList, err := quote(dstColumns)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(
+		"INSERT INTO `%s` (%s) SELECT %s FROM `%s`; DROP TABLE `%s`",
+		dstPath, dstList, srcList, srcPath, srcPath,
+	), nil
+}
+
 // columnDefinitions returns the column definition list of a CREATE TABLE
 // statement and the quoted column names. A DEFAULT expression is closed on
 // a line of its own, so that a trailing line comment in it cannot comment

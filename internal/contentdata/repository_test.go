@@ -144,6 +144,46 @@ func TestRebuildTableSQL(t *testing.T) {
 	}
 }
 
+func TestCreateTableLikeSQL(t *testing.T) {
+	r := NewRepository()
+	dst := &bigqueryv2.TableReference{ProjectId: "p", DatasetId: "ds", TableId: "t"}
+	tmp := &bigqueryv2.TableReference{ProjectId: "p", DatasetId: "ds", TableId: "tmp"}
+
+	got, err := r.CreateTableSQL(dst, []ColumnDefinition{{Name: "a", Type: "INT64", NotNull: true}, {Name: "b", Type: "STRING", Default: "'x'"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE `p.ds.t` (`a` INT64 NOT NULL, `b` STRING DEFAULT ('x'\n))"; got != want {
+		t.Errorf("CreateTableSQL =\n%s\nwant\n%s", got, want)
+	}
+	if _, err := r.CreateTableSQL(dst, nil); err == nil {
+		t.Error("CreateTableSQL accepted a table without columns")
+	}
+
+	// A trailing line comment in the query ends at the newline.
+	got, err = r.CreateTableAsQuerySQL(tmp, "SELECT 1 AS a -- c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "CREATE TABLE `p.ds.tmp` AS SELECT * FROM (\nSELECT 1 AS a -- c\n)"; got != want {
+		t.Errorf("CreateTableAsQuerySQL =\n%s\nwant\n%s", got, want)
+	}
+
+	got, err = r.InsertFromTableSQL(tmp, dst, []string{"B", "a"}, []string{"b", "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "INSERT INTO `p.ds.t` (`b`, `a`) SELECT `B`, `a` FROM `p.ds.tmp`; DROP TABLE `p.ds.tmp`"; got != want {
+		t.Errorf("InsertFromTableSQL =\n%s\nwant\n%s", got, want)
+	}
+	if _, err := r.InsertFromTableSQL(tmp, dst, []string{"a`b"}, []string{"a"}); err == nil {
+		t.Error("InsertFromTableSQL accepted a column name with a backtick")
+	}
+	if _, err := r.InsertFromTableSQL(tmp, dst, []string{"a"}, []string{"a", "b"}); err == nil {
+		t.Error("InsertFromTableSQL accepted column lists of different lengths")
+	}
+}
+
 func TestFieldDDLType(t *testing.T) {
 	for _, c := range []struct {
 		field *bigqueryv2.TableFieldSchema

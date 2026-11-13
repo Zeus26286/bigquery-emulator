@@ -89,6 +89,10 @@ Still needing googlesqlite fixes:
   next DDL on that table.
 - After `CREATE OR REPLACE`, later statements in the same script see the old
   columns.
+- `CREATE TABLE ... LIKE` is rejected by googlesqlite
+  ([goccy/googlesqlite#74](https://github.com/goccy/googlesqlite/issues/74),
+  PR [goccy/googlesqlite#75](https://github.com/goccy/googlesqlite/pull/75));
+  the emulator runs a standalone one itself and rejects it inside a script.
 
 ### 4. ⬜ Invalid queries reported as `jobInternalError` — [#316](https://github.com/goccy/bigquery-emulator/issues/316)
 
