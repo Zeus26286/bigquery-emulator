@@ -172,8 +172,12 @@ func TestAnalyzeDDLCreateTable(t *testing.T) {
 			want:  []create{{ref: "p.ds.c", columns: map[string]column{"a": {required: true}}}},
 		},
 		{
-			name:  "like_ignored",
+			// The table of CREATE TABLE ... LIKE is recorded for
+			// checkDatasets and translateQueryError (see
+			// TestAnalyzeDDLCreateTableLike).
+			name:  "like",
 			query: "CREATE TABLE ds.t LIKE ds.src",
+			want:  []create{{ref: "p.ds.t", columns: map[string]column{}}},
 		},
 		{
 			name:  "unparseable",
@@ -246,6 +250,18 @@ func TestAnalyzeDDLRejects(t *testing.T) {
 		{query: "IF TRUE THEN ALTER TABLE ds.t ADD COLUMN b STRING; END IF", want: errAlterInScript},
 		{query: "ALTER TABLE ds.t ADD COLUMN b STRING;"},
 		{query: "ALTER TABLE ds.t ADD COLUMN b STRING"},
+		{query: "SELECT 1; CREATE TABLE ds.a LIKE ds.b", want: errLikeInScript},
+		{query: "CREATE TABLE ds.a LIKE ds.b; SELECT 1", want: errLikeInScript},
+		{query: "BEGIN CREATE TABLE ds.a LIKE ds.b; END", want: errLikeInScript},
+		{query: "IF TRUE THEN CREATE TABLE ds.a LIKE ds.b; END IF", want: errLikeInScript},
+		{query: "CREATE TABLE nodataset LIKE ds.b", wantMessage: qualify},
+		{query: "CREATE TABLE ds.a LIKE nodataset", wantMessage: qualify},
+		{query: "CREATE TEMP TABLE a LIKE ds.b", wantMessage: "CREATE TEMP TABLE ... LIKE is not supported by the emulator"},
+		{query: "CREATE TABLE ds.a (x INT64) LIKE ds.b", wantMessage: "CREATE TABLE ... LIKE: a column list is not supported by the emulator"},
+		{query: "CREATE TABLE ds.a LIKE ds.b WITH CONNECTION `p.us.c`", wantMessage: "CREATE TABLE ... LIKE: WITH CONNECTION is not supported by the emulator"},
+		{query: "CREATE TABLE ds.a LIKE ds.b DEFAULT COLLATE 'und:ci'", wantMessage: "CREATE TABLE ... LIKE: DEFAULT COLLATE is not supported by the emulator"},
+		{query: "CREATE TABLE ds.a LIKE ds.b;"},
+		{query: "CREATE TABLE nodataset LIKE b", defaultDataset: "ds"},
 	} {
 		t.Run(c.query, func(t *testing.T) {
 			_, err := analyzeDDL(c.query, "p", c.defaultDataset)
@@ -260,6 +276,125 @@ func TestAnalyzeDDLRejects(t *testing.T) {
 				}
 			case err != nil:
 				t.Fatalf("got %v, want no error", err)
+			}
+		})
+	}
+}
+
+func TestAnalyzeDDLCreateTableLike(t *testing.T) {
+	type like struct {
+		ref, srcRef           string // project.dataset.table
+		orReplace             bool
+		ifNotExists           bool
+		partition             *partitionSpec
+		partitionUnrecognized bool
+		clustering            []string
+		clusteringInvalid     bool
+		options               map[string]any // decoded literals; source text for other values
+		queryText             string
+	}
+	for _, c := range []struct {
+		name           string
+		query          string
+		defaultDataset string
+		want           like
+	}{
+		{name: "two_part", query: "CREATE TABLE ds.a LIKE ds2.b", want: like{ref: "p.ds.a", srcRef: "p.ds2.b"}},
+		{name: "three_part", query: "CREATE TABLE `q.ds.a` LIKE q2.ds2.b", want: like{ref: "q.ds.a", srcRef: "q2.ds2.b"}},
+		{name: "default_dataset", query: "CREATE TABLE a LIKE b", defaultDataset: "def", want: like{ref: "p.def.a", srcRef: "p.def.b"}},
+		{name: "or_replace", query: "CREATE OR REPLACE TABLE ds.a LIKE ds.b", want: like{ref: "p.ds.a", srcRef: "p.ds.b", orReplace: true}},
+		{name: "if_not_exists", query: "CREATE TABLE IF NOT EXISTS ds.a LIKE ds.b", want: like{ref: "p.ds.a", srcRef: "p.ds.b", ifNotExists: true}},
+		{
+			name:  "partition_column",
+			query: "CREATE TABLE ds.a LIKE ds.b PARTITION BY d",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", partition: &partitionSpec{kind: "time", unit: "DAY", column: "d"}},
+		},
+		{
+			name:  "partition_date",
+			query: "CREATE TABLE ds.a LIKE ds.b PARTITION BY DATE(ts)",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", partition: &partitionSpec{kind: "time", unit: "DAY", column: "ts", function: "DATE"}},
+		},
+		{
+			name:  "partition_ingestion",
+			query: "CREATE TABLE ds.a LIKE ds.b PARTITION BY _PARTITIONDATE",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", partition: &partitionSpec{kind: "time", unit: "DAY"}},
+		},
+		{
+			name:  "partition_range",
+			query: "CREATE TABLE ds.a LIKE ds.b PARTITION BY RANGE_BUCKET(id, GENERATE_ARRAY(0, 100, 10))",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", partition: &partitionSpec{kind: "range", column: "id", start: 0, end: 100, interval: 10}},
+		},
+		{
+			name:  "partition_unrecognized",
+			query: "CREATE TABLE ds.a LIKE ds.b PARTITION BY MOD(id, 2)",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", partitionUnrecognized: true},
+		},
+		{
+			name:  "cluster_by",
+			query: "CREATE TABLE ds.a LIKE ds.b CLUSTER BY x, y",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", clustering: []string{"x", "y"}},
+		},
+		{
+			name:  "cluster_by_expression",
+			query: "CREATE TABLE ds.a LIKE ds.b CLUSTER BY x, LOWER(y)",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", clusteringInvalid: true},
+		},
+		{
+			name:  "options",
+			query: "CREATE TABLE ds.a LIKE ds.b OPTIONS(description='d', labels=[('k','v')], expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY))",
+			want: like{ref: "p.ds.a", srcRef: "p.ds.b", options: map[string]any{
+				"description":          "d",
+				"labels":               map[string]string{"k": "v"},
+				"expiration_timestamp": "TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)",
+			}},
+		},
+		{
+			name:  "as_query",
+			query: "CREATE TABLE ds.a LIKE ds.b AS WITH x AS (SELECT 1 AS a) SELECT * FROM x;",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", queryText: "WITH x AS (SELECT 1 AS a) SELECT * FROM x"},
+		},
+		{
+			name:  "as_query_union",
+			query: "CREATE TABLE ds.a LIKE ds.b AS (SELECT 1 AS a) UNION ALL (SELECT 2)",
+			want:  like{ref: "p.ds.a", srcRef: "p.ds.b", queryText: "(SELECT 1 AS a) UNION ALL (SELECT 2)"},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			info, err := analyzeDDL(c.query, "p", c.defaultDataset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info == nil || info.like == nil {
+				t.Fatalf("got no CREATE TABLE LIKE: %+v", info)
+			}
+			l := info.like
+			got := like{
+				ref:                   l.ref.ProjectId + "." + l.ref.DatasetId + "." + l.ref.TableId,
+				srcRef:                l.srcRef.ProjectId + "." + l.srcRef.DatasetId + "." + l.srcRef.TableId,
+				orReplace:             l.orReplace,
+				ifNotExists:           l.ifNotExists,
+				partition:             l.partition,
+				partitionUnrecognized: l.partitionUnrecognized,
+				clustering:            l.clustering,
+				clusteringInvalid:     l.clusteringInvalid,
+				queryText:             l.queryText,
+			}
+			if len(l.options) != 0 {
+				got.options = map[string]any{}
+				for _, o := range l.options {
+					if o.isLiteral {
+						got.options[o.name] = o.value
+					} else {
+						got.options[o.name] = o.exprText
+					}
+				}
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("got  %+v\nwant %+v", got, c.want)
+			}
+			// The table is also recorded as created.
+			if len(info.creates) != 1 || info.creates[0].ref != l.ref {
+				t.Fatalf("creates: got %+v", info.creates)
 			}
 		})
 	}

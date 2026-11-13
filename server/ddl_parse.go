@@ -41,6 +41,32 @@ type ddlInfo struct {
 	creates []*createTableDDL
 	// createsSchema is set when the script contains CREATE SCHEMA.
 	createsSchema bool
+	// like is the statement when the query is a standalone CREATE TABLE
+	// ... LIKE, which the emulator runs itself (see create_table_like.go).
+	like *createLikeDDL
+}
+
+// createLikeDDL is a CREATE TABLE ... LIKE statement.
+type createLikeDDL struct {
+	// ref is the table to create, and srcRef the table it copies.
+	ref, srcRef *bigqueryv2.TableReference
+	orReplace   bool
+	ifNotExists bool
+	// partition is the PARTITION BY clause, which replaces the partitioning
+	// of the source table. partitionUnrecognized is set for a PARTITION BY
+	// expression that is not recognised.
+	partition             *partitionSpec
+	partitionUnrecognized bool
+	// clustering is the CLUSTER BY clause, which replaces the clustering of
+	// the source table. clusteringInvalid is set when one of its columns is
+	// not a plain column name.
+	clustering        []string
+	clusteringInvalid bool
+	// options are the entries of the OPTIONS list, each of which overrides
+	// the option of the source table.
+	options []*optionValue
+	// queryText is the source text of the AS query, or empty.
+	queryText string
 }
 
 // createTableDDL is what a CREATE TABLE or CREATE VIEW statement says about
@@ -110,6 +136,14 @@ var ddlKeywordPattern = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\b`)
 // as a no-op). Scripts can then be left to googlesqlite.
 var errAlterInScript = fmt.Errorf("ALTER TABLE inside a multi-statement script is not supported by the emulator; run each ALTER TABLE as a separate query")
 
+// errLikeInScript rejects CREATE TABLE ... LIKE inside a multi-statement
+// script, for the reasons of errAlterInScript: the emulator plans it from the
+// metadata before the query runs.
+//
+// TODO(googlesqlite): implement CREATE TABLE LIKE (goccy/googlesqlite#74,
+// PR #75). Scripts can then be left to googlesqlite.
+var errLikeInScript = fmt.Errorf("CREATE TABLE ... LIKE inside a multi-statement script is not supported by the emulator; run it as a separate query")
+
 // ddlParserOptions are the parser options of the emulator's own parse of
 // DDL statements. They are built once: every object allocated in the
 // googlesql wasm module is freed only by a finalizer, and building them for
@@ -152,7 +186,9 @@ func buildDDLParserOptions() (*googlesql.ParserOptions, error) {
 // analyzeDDL parses query and returns its CREATE TABLE and CREATE VIEW
 // statements. It returns (nil, nil) when query has no DDL to look at or
 // cannot be parsed. An error is the query's error: an unqualified table name
-// without a default dataset, or ALTER TABLE inside a multi-statement script.
+// without a default dataset, ALTER TABLE or CREATE TABLE ... LIKE inside a
+// multi-statement script, or a form of CREATE TABLE ... LIKE the emulator does
+// not support.
 func analyzeDDL(query, defaultProjectID, defaultDatasetID string) (*ddlInfo, error) {
 	if !ddlKeywordPattern.MatchString(query) {
 		return nil, nil
@@ -219,7 +255,7 @@ func (a *ddlAnalyzer) walk(node googlesql.ASTNode, topLevel bool) error {
 		}
 		return nil
 	case *googlesql.ASTCreateTableStatement:
-		return a.createTable(node)
+		return a.createTable(node, topLevel)
 	case *googlesql.ASTCreateViewStatement:
 		return a.createView(node)
 	}
@@ -294,7 +330,16 @@ func (a *ddlAnalyzer) createView(node *googlesql.ASTCreateViewStatement) error {
 	return nil
 }
 
-func (a *ddlAnalyzer) createTable(node *googlesql.ASTCreateTableStatement) error {
+func (a *ddlAnalyzer) createTable(node *googlesql.ASTCreateTableStatement, topLevel bool) error {
+	// LIKE is checked first, since the emulator rejects CREATE TEMP TABLE
+	// ... LIKE rather than leaving it to googlesqlite.
+	like, err := node.LikeTableName()
+	if err != nil {
+		return nil
+	}
+	if like != nil {
+		return a.createTableLike(node, like, topLevel)
+	}
 	if temp, err := node.IsTemp(); err != nil || temp {
 		return nil
 	}
@@ -306,10 +351,7 @@ func (a *ddlAnalyzer) createTable(node *googlesql.ASTCreateTableStatement) error
 	if err != nil || ref == nil {
 		return err
 	}
-	// googlesqlite rejects LIKE, COPY and CLONE.
-	if like, err := node.LikeTableName(); err != nil || like != nil {
-		return nil
-	}
+	// googlesqlite rejects COPY and CLONE.
 	if copySource, err := node.CopyDataSource(); err != nil || copySource != nil {
 		return nil
 	}
@@ -334,6 +376,87 @@ func (a *ddlAnalyzer) createTable(node *googlesql.ASTCreateTableStatement) error
 		create.options = a.options(options)
 	}
 	a.info.creates = append(a.info.creates, create)
+	return nil
+}
+
+// createTableLike records a CREATE TABLE ... LIKE statement, which googlesqlite
+// rejects and the emulator runs itself. It is also recorded as a CREATE of
+// its table, so that checkDatasets and translateQueryError know the table.
+func (a *ddlAnalyzer) createTableLike(node *googlesql.ASTCreateTableStatement, likeName *googlesql.ASTPathExpression, topLevel bool) error {
+	if !topLevel || a.info.statements != 1 {
+		return errLikeInScript
+	}
+	unsupported := func(feature string) error {
+		return fmt.Errorf("CREATE TABLE ... LIKE: %s is not supported by the emulator", feature)
+	}
+	temp, err := node.IsTemp()
+	if err != nil {
+		return nil
+	}
+	if temp {
+		return fmt.Errorf("CREATE TEMP TABLE ... LIKE is not supported by the emulator")
+	}
+	if elements, err := node.TableElementList(); err != nil || elements != nil {
+		return unsupported("a column list")
+	}
+	if connection, err := node.WithConnectionClause(); err != nil || connection != nil {
+		return unsupported("WITH CONNECTION")
+	}
+	if collate, err := node.Collate(); err != nil || collate != nil {
+		return unsupported("DEFAULT COLLATE")
+	}
+	if copySource, err := node.CopyDataSource(); err != nil || copySource != nil {
+		return unsupported("COPY")
+	}
+	if cloneSource, err := node.CloneDataSource(); err != nil || cloneSource != nil {
+		return unsupported("CLONE")
+	}
+	name, err := node.Name()
+	if err != nil {
+		return nil
+	}
+	ref, err := a.tableRef(name)
+	if err != nil || ref == nil {
+		return err
+	}
+	srcRef, err := a.tableRef(likeName)
+	if err != nil || srcRef == nil {
+		return err
+	}
+	like := &createLikeDDL{ref: ref, srcRef: srcRef}
+	if like.orReplace, err = node.IsOrReplace(); err != nil {
+		return nil
+	}
+	if like.ifNotExists, err = node.IsIfNotExists(); err != nil {
+		return nil
+	}
+	if partitionBy, err := node.PartitionBy(); err == nil && partitionBy != nil {
+		if spec, ok := parsePartitionBy(partitionBy); ok {
+			like.partition = spec
+		} else {
+			like.partitionUnrecognized = true
+		}
+	}
+	if clusterBy, err := node.ClusterBy(); err == nil && clusterBy != nil {
+		like.clustering = parseClusterBy(clusterBy)
+		like.clusteringInvalid = len(like.clustering) == 0
+	}
+	if options, err := node.OptionsList(); err == nil && options != nil {
+		parsed, err := parseOptions(a.query, options)
+		if err != nil {
+			return unsupported("this OPTIONS list")
+		}
+		like.options = parsed
+	}
+	if query, err := node.Query(); err == nil && query != nil {
+		text, ok := sourceText(a.query, query)
+		if !ok {
+			return unsupported("this AS query")
+		}
+		like.queryText = text
+	}
+	a.info.like = like
+	a.info.creates = append(a.info.creates, &createTableDDL{ref: ref, columns: map[string]*columnAnnotation{}})
 	return nil
 }
 

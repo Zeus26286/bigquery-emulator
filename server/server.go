@@ -34,8 +34,9 @@ type Server struct {
 	httpServer     *http.Server
 	grpcServer     *grpc.Server
 	listenCallback func(httpAddr, grpcAddr string)
-	// alterMu serializes the ALTER TABLE statements the emulator rewrites
-	// (see alter_table.go).
+	// alterMu serializes the DDL statements the emulator rewrites: ALTER
+	// TABLE (see alter_table.go) and CREATE TABLE ... LIKE (see
+	// create_table_like.go).
 	alterMu sync.Mutex
 }
 

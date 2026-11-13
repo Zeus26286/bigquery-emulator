@@ -122,6 +122,11 @@ func TestDDLMetadata(t *testing.T) {
 		{"alter_column_actions", testAlterColumnActions},
 		{"alter_primary_key", testAlterTablePrimaryKey},
 		{"alter_rebuild_keeps_constraints", testAlterRebuildKeepsConstraints},
+		{"create_table_like_copies", testCreateTableLikeCopies},
+		{"create_table_like_overrides", testCreateTableLikeOverrides},
+		{"create_table_like_as_query", testCreateTableLikeAsQuery},
+		{"create_table_like_or_replace", testCreateTableLikeOrReplace},
+		{"create_table_like_if_not_exists", testCreateTableLikeIfNotExists},
 	} {
 		for _, mode := range ddlModes {
 			t.Run(c.name+"/"+mode, func(t *testing.T) {
@@ -137,6 +142,9 @@ func TestDDLMetadata(t *testing.T) {
 		{"table_not_found_suggestion", testTableNotFoundSuggestion},
 		{"alter_rebuild_of_api_table", testAlterRebuildOfAPITable},
 		{"alter_key_columns_of_ddl_table", testAlterKeyColumnsOfDDLTable},
+		{"create_table_like_errors", testCreateTableLikeErrors},
+		{"create_table_like_api_table", testCreateTableLikeOfAPITable},
+		{"rewrite_failing_after_run", testRewriteFailingAfterRun},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			c.test(t, env)
@@ -635,4 +643,324 @@ func testAlterKeyColumnsOfDDLTable(t *testing.T, env *ddlTestEnv) {
 	assertErrContains(t, env.runQueryJob(t, "ALTER TABLE dataset1.kc RENAME COLUMN c TO c2"), "clustering column")
 	env.mustExec(t, "jobs.insert", "ALTER TABLE dataset1.kc DROP COLUMN n")
 	assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "kc"), "ts", "c")
+}
+
+func testCreateTableLikeCopies(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lsrc (id INT64 NOT NULL OPTIONS(description='i'), s STRING DEFAULT 'x', r STRUCT<a INT64, b ARRAY<STRING>>, arr ARRAY<INT64>, d DATE, PRIMARY KEY (id) NOT ENFORCED) "+
+		"PARTITION BY d CLUSTER BY id OPTIONS(description='t', friendly_name='f', labels=[('k','v')], require_partition_filter=true, partition_expiration_days=2)")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lsrc (id, d) VALUES (1, '2024-01-01')")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".l1 LIKE "+ds+".lsrc")
+	src, md := env.metadata(t, ds, "lsrc"), env.metadata(t, ds, "l1")
+	if !reflect.DeepEqual(md.Schema, src.Schema) {
+		t.Fatalf("schema: got %+v, want %+v", md.Schema, src.Schema)
+	}
+	if id, s := md.Schema[0], md.Schema[1]; !id.Required || id.Description != "i" || s.DefaultValueExpression != "'x'" {
+		t.Fatalf("columns: got %+v, %+v", id, s)
+	}
+	if md.TimePartitioning == nil || md.TimePartitioning.Field != "d" || md.TimePartitioning.Expiration != 48*time.Hour {
+		t.Fatalf("timePartitioning: got %+v", md.TimePartitioning)
+	}
+	if md.Clustering == nil || !reflect.DeepEqual(md.Clustering.Fields, []string{"id"}) {
+		t.Fatalf("clustering: got %+v", md.Clustering)
+	}
+	if md.Description != "t" || md.Name != "f" || !reflect.DeepEqual(md.Labels, map[string]string{"k": "v"}) || !md.RequirePartitionFilter {
+		t.Fatalf("options: got description %q, friendlyName %q, labels %v, requirePartitionFilter %v", md.Description, md.Name, md.Labels, md.RequirePartitionFilter)
+	}
+	if md.TableConstraints == nil || md.TableConstraints.PrimaryKey == nil || !reflect.DeepEqual(md.TableConstraints.PrimaryKey.Columns, []string{"id"}) {
+		t.Fatalf("tableConstraints: got %+v", md.TableConstraints)
+	}
+	if rows := env.mustRead(t, "SELECT COUNT(*) FROM "+ds+".l1"); len(rows) != 1 || rows[0][0] != int64(0) {
+		t.Fatalf("rows: got %v", rows)
+	}
+	// The new table enforces the NOT NULL and DEFAULT of the source table.
+	assertErrContains(t, env.exec(t, mode, "INSERT INTO "+ds+".l1 (s) VALUES ('y')"), "Required field id cannot be null")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".l1 (id, r) VALUES (1, STRUCT(2 AS a, ['b'] AS b))")
+	if rows := env.mustRead(t, "SELECT s, r.a FROM "+ds+".l1"); len(rows) != 1 || rows[0][0] != "x" || rows[0][1] != int64(2) {
+		t.Fatalf("rows: got %v", rows)
+	}
+}
+
+func testCreateTableLikeOverrides(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lov (id INT64, s STRING, d DATE) PARTITION BY d CLUSTER BY id OPTIONS(description='t', friendly_name='f', labels=[('k','v')])")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lov1 LIKE "+ds+".lov PARTITION BY RANGE_BUCKET(id, GENERATE_ARRAY(0, 100, 10)) CLUSTER BY s OPTIONS(description='n')")
+	md := env.metadata(t, ds, "lov1")
+	if rp := md.RangePartitioning; rp == nil || rp.Field != "id" || rp.Range == nil || rp.Range.End != 100 || rp.Range.Interval != 10 {
+		t.Fatalf("rangePartitioning: got %+v", md.RangePartitioning)
+	}
+	if md.TimePartitioning != nil {
+		t.Fatalf("timePartitioning: got %+v", md.TimePartitioning)
+	}
+	if md.Clustering == nil || !reflect.DeepEqual(md.Clustering.Fields, []string{"s"}) {
+		t.Fatalf("clustering: got %+v", md.Clustering)
+	}
+	if md.Description != "n" || md.Name != "f" || !reflect.DeepEqual(md.Labels, map[string]string{"k": "v"}) {
+		t.Fatalf("options: got description %q, friendlyName %q, labels %v", md.Description, md.Name, md.Labels)
+	}
+
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lpd (a INT64) PARTITION BY _PARTITIONDATE")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lpd1 LIKE "+ds+".lpd")
+	if tp := env.metadata(t, ds, "lpd1").TimePartitioning; tp == nil || tp.Type != bigquery.DayPartitioningType || tp.Field != "" {
+		t.Fatalf("lpd1 timePartitioning: got %+v", tp)
+	}
+
+	assertErrContains(t, env.exec(t, mode, "CREATE TABLE "+ds+".lov2 LIKE "+ds+".lov PARTITION BY nope"), "Unrecognized name: nope")
+	assertErrContains(t, env.exec(t, mode, "CREATE TABLE "+ds+".lov2 LIKE "+ds+".lov CLUSTER BY nope"), "Invalid field: nope")
+	env.assertTableNotFound(t, ds, "lov2")
+}
+
+func testCreateTableLikeAsQuery(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".laq (id INT64 NOT NULL, s STRING DEFAULT 'x', n NUMERIC)")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".laq1 LIKE "+ds+".laq AS SELECT 1 AS id, 'a' AS s, 2 AS n UNION ALL SELECT 2, 'b', 3")
+	if rows := env.mustRead(t, "SELECT id, s, CAST(n AS STRING) FROM "+ds+".laq1 ORDER BY id"); !reflect.DeepEqual(rows, [][]bigquery.Value{{int64(1), "a", "2"}, {int64(2), "b", "3"}}) {
+		t.Fatalf("laq1 rows: got %v", rows)
+	}
+	if md := env.metadata(t, ds, "laq1"); len(md.Schema) != 3 || !md.Schema[0].Required || md.Schema[2].Type != bigquery.NumericFieldType {
+		t.Fatalf("laq1 schema: got %+v", md.Schema)
+	}
+
+	// The columns of the query are matched by name.
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".laq2 LIKE "+ds+".laq AS SELECT 'c' AS S, 5 AS n, 3 AS ID")
+	if rows := env.mustRead(t, "SELECT id, s FROM "+ds+".laq2"); !reflect.DeepEqual(rows, [][]bigquery.Value{{int64(3), "c"}}) {
+		t.Fatalf("laq2 rows: got %v", rows)
+	}
+	assertNames(t, "laq2 schema", env.tableSchemaNames(t, ds, "laq2"), "id", "s", "n")
+
+	assertErrContains(t, env.exec(t, mode, "CREATE TABLE "+ds+".laq3 LIKE "+ds+".laq AS SELECT 1 AS id, 'a' AS x, 2 AS n"), "do not match the columns of table test:"+ds+".laq")
+	env.assertTableNotFound(t, ds, "laq3")
+
+	// A failed insert leaves nothing behind, and the name stays free.
+	assertErrContains(t, env.exec(t, mode, "CREATE TABLE "+ds+".laq4 LIKE "+ds+".laq AS SELECT CAST(NULL AS INT64) AS id, 'a' AS s, 1 AS n"), "Required field id cannot be null")
+	env.assertTableNotFound(t, ds, "laq4")
+	for _, id := range env.tableIDs(t, ds) {
+		if strings.HasPrefix(id, "__bqemu_like_") {
+			t.Fatalf("table %s left behind", id)
+		}
+	}
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".laq4 LIKE "+ds+".laq")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".laq4 (id) VALUES (1)")
+	if rows := env.mustRead(t, "SELECT s FROM "+ds+".laq4"); len(rows) != 1 || rows[0][0] != "x" {
+		t.Fatalf("laq4 rows: got %v", rows)
+	}
+}
+
+func testCreateTableLikeOrReplace(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lrs (id INT64 NOT NULL, s STRING DEFAULT 'x') OPTIONS(description='src')")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lrs (id) VALUES (1)")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lrd (z BOOL NOT NULL, w STRING DEFAULT 'w') OPTIONS(description='old')")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lrd (z) VALUES (TRUE)")
+
+	// A failed CREATE OR REPLACE keeps the replaced table as it was.
+	assertErrContains(t, env.exec(t, mode, "CREATE OR REPLACE TABLE "+ds+".lrd LIKE "+ds+".lrs AS SELECT CAST(NULL AS INT64) AS id, 'a' AS s"), "Required field id cannot be null")
+	assertNames(t, "lrd schema", env.tableSchemaNames(t, ds, "lrd"), "z", "w")
+	if md := env.metadata(t, ds, "lrd"); md.Description != "old" || !md.Schema[0].Required || md.Schema[1].DefaultValueExpression != "'w'" {
+		t.Fatalf("lrd metadata: got description %q, schema %+v", md.Description, md.Schema)
+	}
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lrd (z) VALUES (FALSE)")
+	if rows := env.mustRead(t, "SELECT z, w FROM "+ds+".lrd ORDER BY z"); !reflect.DeepEqual(rows, [][]bigquery.Value{{false, "w"}, {true, "w"}}) {
+		t.Fatalf("lrd rows: got %v", rows)
+	}
+	assertErrContains(t, env.exec(t, mode, "INSERT INTO "+ds+".lrd (w) VALUES ('q')"), "Required field z cannot be null")
+
+	env.mustExec(t, mode, "CREATE OR REPLACE TABLE "+ds+".lrd LIKE "+ds+".lrs")
+	assertNames(t, "lrd schema", env.tableSchemaNames(t, ds, "lrd"), "id", "s")
+	if md := env.metadata(t, ds, "lrd"); md.Description != "src" {
+		t.Fatalf("lrd description: got %q", md.Description)
+	}
+	if rows := env.mustRead(t, "SELECT COUNT(*) FROM "+ds+".lrd"); len(rows) != 1 || rows[0][0] != int64(0) {
+		t.Fatalf("lrd rows: got %v", rows)
+	}
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lrd (id) VALUES (5)")
+	if rows := env.mustRead(t, "SELECT id, s FROM "+ds+".lrd"); !reflect.DeepEqual(rows, [][]bigquery.Value{{int64(5), "x"}}) {
+		t.Fatalf("lrd rows: got %v", rows)
+	}
+
+	// The query runs before the table is replaced.
+	env.mustExec(t, mode, "CREATE OR REPLACE TABLE "+ds+".lrs LIKE "+ds+".lrs AS SELECT * FROM "+ds+".lrs")
+	if rows := env.mustRead(t, "SELECT id, s FROM "+ds+".lrs"); !reflect.DeepEqual(rows, [][]bigquery.Value{{int64(1), "x"}}) {
+		t.Fatalf("lrs rows: got %v", rows)
+	}
+	if md := env.metadata(t, ds, "lrs"); md.Description != "src" {
+		t.Fatalf("lrs description: got %q", md.Description)
+	}
+}
+
+func testCreateTableLikeIfNotExists(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".lin (a INT64)")
+	env.mustExec(t, mode, "INSERT INTO "+ds+".lin (a) VALUES (1)")
+	env.mustExec(t, mode, "CREATE TABLE "+ds+".linsrc (b STRING)")
+	env.mustExec(t, mode, "CREATE TABLE IF NOT EXISTS "+ds+".lin LIKE "+ds+".linsrc")
+	assertNames(t, "lin schema", env.tableSchemaNames(t, ds, "lin"), "a")
+	if rows := env.mustRead(t, "SELECT a FROM "+ds+".lin"); len(rows) != 1 || rows[0][0] != int64(1) {
+		t.Fatalf("lin rows: got %v", rows)
+	}
+	env.mustExec(t, mode, "CREATE TABLE IF NOT EXISTS "+ds+".lin2 LIKE "+ds+".linsrc")
+	assertNames(t, "lin2 schema", env.tableSchemaNames(t, ds, "lin2"), "b")
+}
+
+func testCreateTableLikeErrors(t *testing.T, env *ddlTestEnv) {
+	env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.le (a INT64)")
+	env.mustExec(t, "jobs.insert", "CREATE VIEW dataset1.lev AS SELECT 1 AS a")
+	env.mustExec(t, "jobs.insert", "CREATE TABLE dataset2.lcross (q STRING)")
+	for _, mode := range ddlModes {
+		for _, c := range []struct {
+			sql, reason, msg string
+			status           int
+		}{
+			{"CREATE TABLE dataset1.lx LIKE dataset1.nosuch", "notFound", "Not found: Table test:dataset1.nosuch", http.StatusNotFound},
+			{"CREATE TABLE nods.lx LIKE dataset1.le", "notFound", "Not found: Dataset test:nods", http.StatusNotFound},
+			{"CREATE TABLE dataset1.lx LIKE nods.le", "notFound", "Not found: Dataset test:nods", http.StatusNotFound},
+			{"CREATE TABLE dataset1.le LIKE dataset1.le", "duplicate", "Already Exists: Table test:dataset1.le", http.StatusConflict},
+		} {
+			code, reason, msg := env.queryError(t, mode, c.sql)
+			wantCode := c.status
+			if mode == "jobs.insert" {
+				wantCode = http.StatusOK
+			}
+			if code != wantCode || reason != c.reason || msg != c.msg {
+				t.Fatalf("%s %s: got HTTP %d %q %q", mode, c.sql, code, reason, msg)
+			}
+		}
+		assertErrContains(t, env.exec(t, mode, "CREATE TABLE dataset1.lx LIKE dataset1.lev"), "not supported by the emulator for view test:dataset1.lev")
+		assertErrContains(t, env.exec(t, mode, "SELECT 1; CREATE TABLE dataset1.lx LIKE dataset1.le"), "CREATE TABLE ... LIKE inside a multi-statement script is not supported by the emulator")
+		assertErrContains(t, env.execIn(t, mode, "", "CREATE TABLE lx LIKE dataset1.le"), `Table "lx" must be qualified with a dataset (e.g. dataset.table).`)
+		env.assertTableNotFound(t, "dataset1", "lx")
+
+		table := "lq_" + strings.ReplaceAll(mode, ".", "_")
+		if err := env.execIn(t, mode, "dataset1", "CREATE TABLE "+table+" LIKE le"); err != nil {
+			t.Fatal(err)
+		}
+		assertNames(t, table, env.tableSchemaNames(t, "dataset1", table), "a")
+		table = "lc_" + strings.ReplaceAll(mode, ".", "_")
+		env.mustExec(t, mode, "CREATE TABLE dataset1."+table+" LIKE dataset2.lcross")
+		assertNames(t, table, env.tableSchemaNames(t, "dataset1", table), "q")
+	}
+
+	// A dry run checks the statement and creates nothing.
+	dryRun := func(sql string) error {
+		q := env.client.Query(sql)
+		q.DryRun = true
+		job, err := q.Run(env.ctx)
+		if err != nil {
+			return err
+		}
+		return job.LastStatus().Err()
+	}
+	if err := dryRun("CREATE TABLE dataset1.ldry LIKE dataset1.le AS SELECT 1 AS a"); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	assertErrContains(t, dryRun("CREATE TABLE dataset1.ldry LIKE dataset1.le AS SELECT 1 AS b"), "do not match the columns")
+	assertErrContains(t, dryRun("CREATE TABLE dataset1.ldry LIKE dataset1.nosuch"), "Not found: Table test:dataset1.nosuch")
+	env.assertTableNotFound(t, "dataset1", "ldry")
+
+	// The Go client reads the error of a job from jobs.getQueryResults.
+	var gerr *googleapi.Error
+	if err := env.runQueryJob(t, "CREATE TABLE dataset1.le LIKE dataset1.le"); !errors.As(err, &gerr) || gerr.Code != http.StatusConflict {
+		t.Fatalf("want a 409, got %v", err)
+	}
+	if err := env.runQueryJob(t, "CREATE TABLE dataset1.lx LIKE dataset1.nosuch"); !errors.As(err, &gerr) || gerr.Code != http.StatusNotFound {
+		t.Fatalf("want a 404, got %v", err)
+	}
+}
+
+// testCreateTableLikeOfAPITable copies a table created by tables.insert,
+// whose metadata says more than DDL can: nested modes and descriptions,
+// type parameters and range partitioning.
+func testCreateTableLikeOfAPITable(t *testing.T, env *ddlTestEnv) {
+	if err := env.client.Dataset("dataset1").Table("lapi").Create(env.ctx, &bigquery.TableMetadata{
+		Schema: bigquery.Schema{
+			{Name: "id", Type: bigquery.IntegerFieldType, Required: true},
+			{Name: "s", Type: bigquery.StringFieldType, MaxLength: 5},
+			{Name: "n", Type: bigquery.NumericFieldType, Precision: 10, Scale: 2},
+			{Name: "r", Type: bigquery.RecordFieldType, Description: "rec", Schema: bigquery.Schema{
+				{Name: "a", Type: bigquery.IntegerFieldType, Required: true, Description: "nested"},
+				{Name: "b", Type: bigquery.StringFieldType, Repeated: true},
+			}},
+		},
+		RangePartitioning: &bigquery.RangePartitioning{Field: "id", Range: &bigquery.RangePartitioningRange{Start: 0, End: 100, Interval: 10}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.lapi2 LIKE dataset1.lapi")
+	src, md := env.metadata(t, "dataset1", "lapi"), env.metadata(t, "dataset1", "lapi2")
+	if !reflect.DeepEqual(md.Schema, src.Schema) {
+		t.Fatalf("schema: got %+v, want %+v", md.Schema, src.Schema)
+	}
+	if r := md.Schema[3]; r.Description != "rec" || !r.Schema[0].Required || r.Schema[0].Description != "nested" || md.Schema[1].MaxLength != 5 || md.Schema[2].Precision != 10 || md.Schema[2].Scale != 2 {
+		t.Fatalf("schema: got %+v", md.Schema)
+	}
+	if !reflect.DeepEqual(md.RangePartitioning, src.RangePartitioning) {
+		t.Fatalf("rangePartitioning: got %+v, want %+v", md.RangePartitioning, src.RangePartitioning)
+	}
+	env.mustExec(t, "jobs.insert", "INSERT INTO dataset1.lapi2 (id, r) VALUES (1, STRUCT(2 AS a, ['x'] AS b))")
+	if rows := env.mustRead(t, "SELECT r.a, r.b[OFFSET(0)] FROM dataset1.lapi2"); !reflect.DeepEqual(rows, [][]bigquery.Value{{int64(2), "x"}}) {
+		t.Fatalf("rows: got %v", rows)
+	}
+}
+
+// testRewriteFailingAfterRun checks that an ALTER TABLE or CREATE TABLE ...
+// LIKE whose job fails after its steps ran leaves the table as it was: the
+// steps are rolled back and googlesqlite's in-memory catalog is repaired. A
+// job ID in use is rejected before anything runs.
+func testRewriteFailingAfterRun(t *testing.T, env *ddlTestEnv) {
+	post := func(t *testing.T, body string) (int, string) {
+		t.Helper()
+		resp, err := http.Post(env.url+"/bigquery/v2/projects/test/jobs", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, string(b)
+	}
+	env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.rfsrc (id INT64 NOT NULL, s STRING)")
+	check := func(t *testing.T, table string) {
+		t.Helper()
+		assertNames(t, table+" schema", env.tableSchemaNames(t, "dataset1", table), "x", "y")
+		if rows := env.mustRead(t, "SELECT * FROM dataset1."+table); !reflect.DeepEqual(rows, [][]bigquery.Value{{"a", "b"}}) {
+			t.Fatalf("%s rows: got %v", table, rows)
+		}
+		assertErrContains(t, env.exec(t, "jobs.insert", "INSERT INTO dataset1."+table+" (y) VALUES ('c')"), "Required field x cannot be null")
+		for _, id := range env.tableIDs(t, "dataset1") {
+			if strings.HasPrefix(id, "__bqemu_") {
+				t.Fatalf("table %s left behind", id)
+			}
+		}
+		if rows := env.mustRead(t, "SELECT COUNT(*) FROM dataset1.INFORMATION_SCHEMA.TABLES WHERE STARTS_WITH(table_name, '__bqemu_')"); len(rows) != 1 || rows[0][0] != int64(0) {
+			t.Fatalf("INFORMATION_SCHEMA.TABLES: got %v", rows)
+		}
+	}
+	for i, sql := range []string{
+		"CREATE OR REPLACE TABLE dataset1.%s LIKE dataset1.rfsrc",
+		"CREATE OR REPLACE TABLE dataset1.%s LIKE dataset1.rfsrc AS SELECT 1 AS id, 'q' AS s",
+		"ALTER TABLE dataset1.%s DROP COLUMN y",
+		"ALTER TABLE dataset1.%s ADD COLUMN z STRING",
+	} {
+		table := fmt.Sprintf("rf%d", i)
+		env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1."+table+" (x STRING NOT NULL, y STRING)")
+		env.mustExec(t, "jobs.insert", "INSERT INTO dataset1."+table+" (x, y) VALUES ('a', 'b')")
+		sql = fmt.Sprintf(sql, table)
+
+		// A job ID in use.
+		jobID := fmt.Sprintf("rf_dup_%d_%d", i, time.Now().UnixNano())
+		if code, body := post(t, fmt.Sprintf(`{"jobReference":{"projectId":"test","jobId":%q},"configuration":{"query":{"query":"SELECT 1","useLegacySql":false}}}`, jobID)); code != http.StatusOK {
+			t.Fatalf("first job: HTTP %d %s", code, body)
+		}
+		code, body := post(t, fmt.Sprintf(`{"jobReference":{"projectId":"test","jobId":%q},"configuration":{"query":{"query":%q,"useLegacySql":false}}}`, jobID, sql))
+		if code != http.StatusConflict || !strings.Contains(body, "Already Exists: Job test:"+jobID) {
+			t.Fatalf("%s with a job ID in use: got HTTP %d %s", sql, code, body)
+		}
+		check(t, table)
+
+		// A failure after the steps ran: the destination table of the
+		// job is missing and may not be created.
+		code, body = post(t, fmt.Sprintf(`{"jobReference":{"projectId":"test","jobId":"rf_dest_%d_%d"},"configuration":{"query":{"query":%q,"useLegacySql":false,`+
+			`"destinationTable":{"projectId":"test","datasetId":"dataset1","tableId":"rf_nodest"},"createDisposition":"CREATE_NEVER"}}}`, i, time.Now().UnixNano(), sql))
+		if code == http.StatusOK {
+			t.Fatalf("%s with a missing destination table: got HTTP %d %s", sql, code, body)
+		}
+		check(t, table)
+	}
 }
