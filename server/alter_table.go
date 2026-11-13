@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,47 +12,73 @@ import (
 	"github.com/goccy/go-googlesql"
 	"github.com/goccy/go-json"
 	"github.com/goccy/googlesqlite"
+	"go.uber.org/zap"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
 
 	"github.com/goccy/bigquery-emulator/internal/connection"
 	"github.com/goccy/bigquery-emulator/internal/contentdata"
+	"github.com/goccy/bigquery-emulator/internal/logger"
 	"github.com/goccy/bigquery-emulator/internal/metadata"
+	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
 	"github.com/goccy/bigquery-emulator/types"
 )
 
 // googlesqlite runs ALTER TABLE as a no-op: neither the SQLite table nor any
-// catalog changes. A standalone ALTER TABLE that only adds, drops or renames
-// columns, or renames the table, is therefore rewritten here into a script
-// that rebuilds the table by copying its rows, which googlesqlite runs
-// faithfully. The emulator's table metadata is then updated from the plan, so
-// that column descriptions and modes survive the rebuild.
+// catalog changes. Every standalone ALTER TABLE statement is therefore
+// handled here: either all its actions are supported, or the statement fails
+// with an explicit error.
 //
-// ALTER TABLE inside a multi-statement script and any other action are left
-// to googlesqlite. ALTER TABLE statements are serialized (Server.alterMu)
-// because the plan is built from the metadata before the rebuild runs, and
-// checkUnchanged guards the rebuild against any other concurrent change.
+// An action that changes the columns (ADD/DROP/RENAME COLUMN, ALTER COLUMN
+// SET DATA TYPE, DROP NOT NULL, SET/DROP DEFAULT) or RENAME TO rebuilds the
+// table by copying its rows, which googlesqlite runs faithfully. The rebuild
+// keeps the NOT NULL and DEFAULT constraints googlesqlite applies to the
+// table. Actions that change only the metadata (SET OPTIONS, ALTER COLUMN SET
+// OPTIONS, ADD/DROP PRIMARY KEY) run nothing. In both cases the emulator's
+// table metadata is then updated from the plan, so that column descriptions
+// and modes survive the rebuild.
 //
-// TODO(googlesqlite): implement ALTER TABLE ADD/DROP/RENAME COLUMN and
-// RENAME TO, and report it through ChangedCatalog.Table.Updated (no upstream
-// issue yet; googlesqlite runs ALTER TABLE as a no-op). Once it does, this
-// file can be removed.
+// ALTER TABLE inside a multi-statement script is rejected (analyzeDDL).
+// ALTER TABLE statements are serialized (Server.alterMu) because the plan is
+// built from the metadata before the rebuild runs, and checkUnchanged guards
+// the rebuild against any other concurrent change.
+//
+// TODO(googlesqlite): implement ALTER TABLE and report it through
+// ChangedCatalog.Table.Updated (no upstream issue yet; googlesqlite runs
+// ALTER TABLE as a no-op). Once it does, this file can be removed.
 
 // alterTablePlan is a standalone ALTER TABLE statement rewritten into a
-// table rebuild.
+// table rebuild and a metadata update.
 type alterTablePlan struct {
 	ref *bigqueryv2.TableReference
 	// newRef is the new name of the table for RENAME TO, and nil otherwise.
 	newRef *bigqueryv2.TableReference
-	// tmpRef is the table the rows go through for a column change.
+	// tmpRef is the table the rows go through during a rebuild.
 	tmpRef *bigqueryv2.TableReference
 	// sourceColumns are the columns of the table when the plan was made.
 	// The rebuild runs only if the table still has them (checkUnchanged).
 	sourceColumns []string
-	// columns is the final column list for a column change.
+	// columns is the final column list.
 	columns []*alterColumn
-	// sql is the rewritten script. An empty sql means that there is
-	// nothing to do and the statement succeeds without running anything.
+	// options are the table options set by SET OPTIONS, evaluated, in
+	// order.
+	options []*optionValue
+	// primaryKey is the primary key after the statement, when primaryKeySet.
+	primaryKey    []string
+	primaryKeySet bool
+	// changed is set when the statement changes the table metadata.
+	changed bool
+	// sql is the first step of the rebuild (contentdata.RebuildTableSQL).
+	// An empty sql means that no rebuild is needed: the statement succeeds
+	// without running anything, and only the metadata changes.
 	sql string
+	// What the steps of a rebuild changed in googlesqlite's catalog, which
+	// repairCatalog undoes when the rebuild is rolled back: srcSpec is the
+	// spec of the table the first step dropped, tmpAdded is set when it
+	// created the temporary table, and newRefAdded when the second step
+	// created the table of RENAME TO.
+	srcSpec     *googlesqlite.TableSpec
+	tmpAdded    bool
+	newRefAdded bool
 }
 
 type alterColumn struct {
@@ -61,16 +88,32 @@ type alterColumn struct {
 	// oldField is the column's schema before the change, or nil for an
 	// added column.
 	oldField *bigqueryv2.TableFieldSchema
+	// field is the column's schema after the change for a kept column.
+	field *bigqueryv2.TableFieldSchema
 	// annotation is what the ADD COLUMN statement says about an added
 	// column beyond its type.
 	annotation *columnAnnotation
+	// newType is the type set by ALTER COLUMN SET DATA TYPE, or nil.
+	newType *columnTypeName
+	// dropNotNull is set by ALTER COLUMN DROP NOT NULL.
+	dropNotNull bool
+	// defaultSet is set by ALTER COLUMN SET DEFAULT (defaultText is the
+	// expression) and DROP DEFAULT (defaultText is empty).
+	defaultSet  bool
+	defaultText string
+	// keepDefault is set when the defaultValueExpression of oldField was
+	// checked by checkDefaults and can be given to the rebuilt table.
+	keepDefault bool
 }
 
-// columnAnnotation holds the OPTIONS(description=...) and the NOT NULL of a
-// column, and of its nested fields, as written in ADD COLUMN.
+// columnAnnotation holds the OPTIONS(description=...), the NOT NULL and the
+// DEFAULT of a column, and of its nested fields, as written in ADD COLUMN or
+// CREATE TABLE.
 type columnAnnotation struct {
 	description string
 	required    bool
+	// defaultText is the source text of the DEFAULT expression.
+	defaultText string
 	// fields are the annotations of the nested fields, by lower-cased name.
 	fields map[string]*columnAnnotation
 }
@@ -93,6 +136,115 @@ func (a *columnAnnotation) apply(field *bigqueryv2.TableFieldSchema, nested bool
 	}
 }
 
+// columnTypeName is a simple column type: a type name and its parameters,
+// e.g. NUMERIC(10, 2).
+type columnTypeName struct {
+	// name is the canonical GoogleSQL name, e.g. INT64 for INTEGER.
+	name   string
+	params []int64
+}
+
+func (t *columnTypeName) String() string {
+	if len(t.params) == 0 {
+		return t.name
+	}
+	params := make([]string, 0, len(t.params))
+	for _, p := range t.params {
+		params = append(params, strconv.FormatInt(p, 10))
+	}
+	return fmt.Sprintf("%s(%s)", t.name, strings.Join(params, ", "))
+}
+
+// canonicalTypeName returns the GoogleSQL name of a simple type name, as
+// written in DDL or in the table metadata.
+func canonicalTypeName(name string) string {
+	switch name = strings.ToUpper(name); name {
+	case "INTEGER", "INT", "SMALLINT", "BIGINT", "TINYINT", "BYTEINT":
+		return "INT64"
+	case "FLOAT":
+		return "FLOAT64"
+	case "BOOLEAN":
+		return "BOOL"
+	case "DECIMAL":
+		return "NUMERIC"
+	case "BIGDECIMAL":
+		return "BIGNUMERIC"
+	}
+	return name
+}
+
+// fieldTypeName returns the simple type of a column in the table metadata,
+// or nil for an ARRAY or STRUCT column.
+func fieldTypeName(field *bigqueryv2.TableFieldSchema) *columnTypeName {
+	if field.Mode == "REPEATED" || len(field.Fields) != 0 {
+		return nil
+	}
+	t := &columnTypeName{name: canonicalTypeName(field.Type)}
+	switch t.name {
+	case "STRING", "BYTES":
+		if field.MaxLength != 0 {
+			t.params = []int64{field.MaxLength}
+		}
+	case "NUMERIC", "BIGNUMERIC":
+		if field.Precision != 0 {
+			t.params = []int64{field.Precision, field.Scale}
+		}
+	case "RECORD", "STRUCT":
+		return nil
+	}
+	return t
+}
+
+// setDataTypeAllowed reports whether ALTER COLUMN SET DATA TYPE may change a
+// column of type from to type to, and whether the types are the same. The
+// allowed changes are BigQuery's: INT64 to NUMERIC, BIGNUMERIC or FLOAT64,
+// NUMERIC to BIGNUMERIC or FLOAT64, and relaxing or removing the parameters
+// of STRING, BYTES, NUMERIC and BIGNUMERIC.
+func setDataTypeAllowed(from, to *columnTypeName) (allowed, same bool) {
+	if from.name != to.name {
+		if len(to.params) != 0 {
+			return false, false
+		}
+		switch from.name {
+		case "INT64":
+			return to.name == "NUMERIC" || to.name == "BIGNUMERIC" || to.name == "FLOAT64", false
+		case "NUMERIC":
+			return to.name == "BIGNUMERIC" || to.name == "FLOAT64", false
+		}
+		return false, false
+	}
+	if len(from.params) == len(to.params) {
+		same = true
+		for i := range from.params {
+			same = same && from.params[i] == to.params[i]
+		}
+		if same {
+			return true, true
+		}
+	}
+	switch {
+	case len(to.params) == 0:
+		// Removing the parameters widens the type.
+		return true, false
+	case len(from.params) == 0:
+		return false, false
+	}
+	switch from.name {
+	case "STRING", "BYTES":
+		return len(to.params) == 1 && to.params[0] >= from.params[0], false
+	case "NUMERIC", "BIGNUMERIC":
+		fromScale, toScale := int64(0), int64(0)
+		if len(from.params) > 1 {
+			fromScale = from.params[1]
+		}
+		if len(to.params) > 1 {
+			toScale = to.params[1]
+		}
+		return toScale >= fromScale && to.params[0]-toScale >= from.params[0]-fromScale, false
+	}
+	return false, false
+}
+
 // alterAction is one action of an ALTER TABLE statement.
 type alterAction struct {
 	kind alterActionKind
@@ -105,9 +257,17 @@ type alterAction struct {
 	typeText   string
 	annotation *columnAnnotation
 	notNull    bool
-	ifExists   bool // IF EXISTS, or IF NOT EXISTS for ADD COLUMN
+	ifExists   bool // IF EXISTS, or IF NOT EXISTS for ADD COLUMN and ADD PRIMARY KEY
 	// newPath is the new table name for RENAME TO.
 	newPath []string
+	// options are the entries of SET OPTIONS and ALTER COLUMN SET OPTIONS.
+	options []*optionValue
+	// newType is the type of ALTER COLUMN SET DATA TYPE.
+	newType *columnTypeName
+	// defaultText is the expression of ALTER COLUMN SET DEFAULT.
+	defaultText string
+	// columns are the columns of ADD PRIMARY KEY.
+	columns []string
 }
 
 type alterActionKind int
@@ -117,6 +277,14 @@ const (
 	alterDropColumn
 	alterRenameColumn
 	alterRenameTo
+	alterSetTableOptions
+	alterSetColumnOptions
+	alterDropNotNull
+	alterSetDataType
+	alterSetDefault
+	alterDropDefault
+	alterAddPrimaryKey
+	alterDropPrimaryKey
 )
 
 // parsedAlterTable is the part of an ALTER TABLE statement the plan needs.
@@ -136,8 +304,16 @@ func (p *alterTablePlan) skips(projectID, datasetID, tableID string) bool {
 	return false
 }
 
-// alterTmpTablePrefix starts the name of the table a column change copies
-// the rows through.
+// dstRef is the table the rebuild creates.
+func (p *alterTablePlan) dstRef() *bigqueryv2.TableReference {
+	if p.newRef != nil {
+		return p.newRef
+	}
+	return p.ref
+}
+
+// alterTmpTablePrefix starts the name of the table a rebuild copies the rows
+// through.
 const alterTmpTablePrefix = "__bqemu_alter_"
 
 // alterBeforeRebuildHook, when set by a test, runs between planning an
@@ -187,7 +363,8 @@ func (p *alterTablePlan) checkUnchanged(ctx context.Context, server *Server, tx 
 	tableName := fmt.Sprintf("%s:%s.%s", p.ref.ProjectId, p.ref.DatasetId, p.ref.TableId)
 	columns, err := server.contentRepo.TableColumnNames(ctx, tx, p.ref)
 	if err != nil {
-		return fmt.Errorf("table %s %w: %s", tableName, errAlterConcurrentModification, err)
+		// The error of googlesqlite may name the table by its internal name.
+		return fmt.Errorf("table %s %w: %s", tableName, errAlterConcurrentModification, translateQueryError(err, p.ref.ProjectId, nil))
 	}
 	same := len(columns) == len(p.sourceColumns)
 	for i := 0; same && i < len(columns); i++ {
@@ -202,7 +379,8 @@ func (p *alterTablePlan) checkUnchanged(ctx context.Context, server *Server, tx 
 // planAlterTable returns (nil, nil) when query is not a standalone ALTER TABLE
 // that this layer handles; the caller then runs the query unchanged. An
 // error is the statement's error, to be reported as the query's error.
-func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defaultDatasetID, query string) (*alterTablePlan, error) {
+// params are the query parameters, which SET OPTIONS values may use.
+func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defaultDatasetID, query string, params []*bigqueryv2.QueryParameter) (*alterTablePlan, error) {
 	if !looksLikeAlter(query) {
 		return nil, nil
 	}
@@ -258,7 +436,12 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 		return nil, fmt.Errorf("Not found: Table %s", tableName)
 	}
 	if content.ExternalDataConfiguration != nil || content.Schema == nil {
-		return nil, nil
+		return nil, fmt.Errorf("ALTER TABLE is not supported by the emulator for table %s", tableName)
+	}
+	for _, field := range content.Schema.Fields {
+		if strings.ContainsAny(field.Name, "`\\") {
+			return nil, fmt.Errorf("invalid column name %q", field.Name)
+		}
 	}
 
 	plan := &alterTablePlan{ref: ref}
@@ -269,7 +452,7 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 		if len(stmt.actions) != 1 {
 			return nil, fmt.Errorf("ALTER TABLE RENAME TO cannot be combined with other actions")
 		}
-		return planRenameTable(server, project, plan, content, stmt.actions[0].newPath)
+		return planRenameTable(ctx, server, project, plan, content, stmt.actions[0].newPath, defaultProjectID, defaultDatasetID)
 	}
 
 	isPartitioningColumn := func(name string) bool {
@@ -307,7 +490,11 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 
 	columns := make([]*alterColumn, 0, len(content.Schema.Fields))
 	for _, field := range content.Schema.Fields {
-		columns = append(columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field})
+		copied, err := copyFieldSchema(field)
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field, field: copied})
 	}
 	find := func(name string) int {
 		for i, column := range columns {
@@ -317,7 +504,34 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 		}
 		return -1
 	}
-	changed := false
+	// findKept finds the column of a column action other than ADD COLUMN.
+	// It returns nil when an IF EXISTS action has nothing to do.
+	findKept := func(action *alterAction) (*alterColumn, error) {
+		i := find(action.name)
+		if i < 0 {
+			if action.ifExists {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("Column not found: %s", action.name)
+		}
+		if columns[i].oldField == nil {
+			return nil, fmt.Errorf("ALTER TABLE cannot alter column %s, which the same statement adds", action.name)
+		}
+		return columns[i], nil
+	}
+	var primaryKey []string
+	if content.TableConstraints != nil && content.TableConstraints.PrimaryKey != nil {
+		primaryKey = append(primaryKey, content.TableConstraints.PrimaryKey.Columns...)
+	}
+	primaryKeyIndex := func(name string) int {
+		for i, column := range primaryKey {
+			if strings.EqualFold(column, name) {
+				return i
+			}
+		}
+		return -1
+	}
+	rebuild := false
 	for _, action := range stmt.actions {
 		switch action.kind {
 		case alterAddColumn:
@@ -335,6 +549,7 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 				expr:       fmt.Sprintf("CAST(NULL AS %s)", action.typeText),
 				annotation: action.annotation,
 			})
+			rebuild = true
 		case alterDropColumn:
 			i := find(action.name)
 			if i < 0 {
@@ -348,10 +563,14 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 					return nil, err
 				}
 			}
+			if primaryKeyIndex(columns[i].name) >= 0 {
+				return nil, fmt.Errorf("Cannot drop column %s of table %s because it is part of the primary key", action.name, tableName)
+			}
 			if len(columns) == 1 {
 				return nil, fmt.Errorf("Cannot drop the only column %s of table %s", action.name, tableName)
 			}
 			columns = append(columns[:i], columns[i+1:]...)
+			rebuild = true
 		case alterRenameColumn:
 			i := find(action.name)
 			if i < 0 {
@@ -368,38 +587,197 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 					return nil, err
 				}
 			}
+			if k := primaryKeyIndex(columns[i].name); k >= 0 {
+				primaryKey[k] = action.newName
+				plan.primaryKeySet = true
+			}
 			columns[i].name = action.newName
+			if columns[i].field != nil {
+				columns[i].field.Name = action.newName
+			}
+			rebuild = true
 		case alterRenameTo:
 			return nil, fmt.Errorf("ALTER TABLE RENAME TO cannot be combined with other actions")
+		case alterSetTableOptions:
+			for _, option := range action.options {
+				if err := checkAlterOption("ALTER TABLE SET OPTIONS", option, tableOptionNames); err != nil {
+					return nil, err
+				}
+				if option.needsEval() {
+					if err := evalOptionExpr(ctx, server, defaultProjectID, defaultDatasetID, params, option); err != nil {
+						return nil, fmt.Errorf("ALTER TABLE SET OPTIONS: invalid value for option %s: %w", option.name, err)
+					}
+				}
+				if option.name == "partition_expiration_days" && option.value != nil && content.TimePartitioning == nil {
+					return nil, fmt.Errorf("ALTER TABLE SET OPTIONS: partition_expiration_days can only be set on a time-partitioned table; table %s is not time-partitioned", tableName)
+				}
+				// Validate the value now; the options are applied
+				// again to the metadata after the job committed.
+				if err := applyTableOption(&bigqueryv2.Table{TimePartitioning: &bigqueryv2.TimePartitioning{}}, option); err != nil {
+					return nil, fmt.Errorf("ALTER TABLE SET OPTIONS: %w", err)
+				}
+				plan.options = append(plan.options, option)
+			}
+		case alterSetColumnOptions:
+			column, err := findKept(action)
+			if err != nil {
+				return nil, err
+			}
+			for _, option := range action.options {
+				if err := checkAlterOption("ALTER TABLE ALTER COLUMN SET OPTIONS", option, map[string]bool{"description": true}); err != nil {
+					return nil, err
+				}
+				if option.needsEval() {
+					if err := evalOptionExpr(ctx, server, defaultProjectID, defaultDatasetID, params, option); err != nil {
+						return nil, fmt.Errorf("ALTER TABLE ALTER COLUMN SET OPTIONS: invalid value for option %s: %w", option.name, err)
+					}
+				}
+				var description string
+				if option.value != nil {
+					s, ok := option.value.(string)
+					if !ok {
+						return nil, fmt.Errorf("ALTER TABLE ALTER COLUMN SET OPTIONS: description must be a STRING")
+					}
+					description = s
+				}
+				if column != nil {
+					column.field.Description = description
+				}
+			}
+		case alterDropNotNull:
+			column, err := findKept(action)
+			if err != nil {
+				return nil, err
+			}
+			if column == nil {
+				continue
+			}
+			if column.field.Mode == "REQUIRED" {
+				column.field.Mode = "NULLABLE"
+			}
+			// The SQLite table may have a NOT NULL constraint even
+			// when the metadata does not say REQUIRED, so the table is
+			// always rebuilt.
+			column.dropNotNull = true
+			rebuild = true
+		case alterSetDataType:
+			column, err := findKept(action)
+			if err != nil {
+				return nil, err
+			}
+			if column == nil {
+				continue
+			}
+			oldType := fieldTypeName(column.field)
+			allowed, same := false, false
+			if oldType != nil {
+				allowed, same = setDataTypeAllowed(oldType, action.newType)
+			}
+			if !allowed {
+				from := column.field.Type
+				if oldType != nil {
+					from = oldType.String()
+				}
+				return nil, fmt.Errorf("ALTER TABLE ALTER COLUMN SET DATA TYPE requires that the existing column type (%s) is assignable to the new type (%s)", from, action.newType)
+			}
+			if same {
+				continue
+			}
+			if err := checkKeyColumn("change the type of", column.oldField.Name); err != nil {
+				return nil, err
+			}
+			column.newType = action.newType
+			column.expr = fmt.Sprintf("CAST(%s AS %s)", quoteIdent(column.oldField.Name), action.newType.name)
+			rebuild = true
+		case alterSetDefault, alterDropDefault:
+			column, err := findKept(action)
+			if err != nil {
+				return nil, err
+			}
+			if column == nil {
+				continue
+			}
+			column.defaultSet = true
+			column.defaultText = action.defaultText
+			column.field.DefaultValueExpression = action.defaultText
+			rebuild = true
+		case alterAddPrimaryKey:
+			if len(primaryKey) != 0 {
+				if action.ifExists {
+					continue
+				}
+				return nil, fmt.Errorf("Table %s already has a primary key", tableName)
+			}
+			var keyColumns []string
+			for _, name := range action.columns {
+				i := find(name)
+				if i < 0 {
+					return nil, fmt.Errorf("Column not found: %s", name)
+				}
+				keyColumns = append(keyColumns, columns[i].name)
+			}
+			primaryKey = keyColumns
+			plan.primaryKeySet = true
+		case alterDropPrimaryKey:
+			if len(primaryKey) == 0 {
+				if action.ifExists {
+					continue
+				}
+				return nil, fmt.Errorf("Table %s does not have a primary key", tableName)
+			}
+			primaryKey = nil
+			plan.primaryKeySet = true
 		}
-		changed = true
+		plan.changed = true
 	}
-	if !changed {
+	plan.columns = columns
+	plan.primaryKey = primaryKey
+	if !rebuild {
 		return plan, nil
 	}
-	for _, field := range content.Schema.Fields {
-		if strings.ContainsAny(field.Name, "`\\") {
-			return nil, fmt.Errorf("invalid column name %q", field.Name)
-		}
+	if err := plan.checkDefaults(ctx, server, defaultProjectID, defaultDatasetID); err != nil {
+		return nil, err
 	}
 	projection := make([]contentdata.ProjectedColumn, 0, len(columns))
 	for _, column := range columns {
 		projection = append(projection, contentdata.ProjectedColumn{Expr: column.expr, Name: column.name})
 	}
-	// A short fixed prefix and a random suffix keep the name bounded
-	// whatever the length of the table name.
-	tmpTableID := alterTmpTablePrefix + randomID()
-	sql, err := server.contentRepo.RebuildTableSQL(ref, ref, tmpTableID, projection)
-	if err != nil {
+	if err := plan.setRebuildSQL(server, projection); err != nil {
 		return nil, err
 	}
-	plan.tmpRef = &bigqueryv2.TableReference{ProjectId: ref.ProjectId, DatasetId: ref.DatasetId, TableId: tmpTableID}
-	plan.columns = columns
-	plan.sql = sql
 	return plan, nil
 }
 
-func planRenameTable(server *Server, project *metadata.Project, plan *alterTablePlan, content *bigqueryv2.Table, newPath []string) (*alterTablePlan, error) {
+// checkAlterOption rejects an OPTIONS entry ALTER TABLE does not support.
+func checkAlterOption(statement string, option *optionValue, supported map[string]bool) error {
+	if !supported[option.name] {
+		return fmt.Errorf("%s: option %s is not supported by the emulator", statement, option.name)
+	}
+	if !option.assign {
+		return fmt.Errorf("%s: only = is supported by the emulator for option %s", statement, option.name)
+	}
+	if option.name == "labels" && !option.isLiteral {
+		return fmt.Errorf("%s: labels must be an array of (STRING, STRING) literals in the emulator", statement)
+	}
+	return nil
+}
+
+// setRebuildSQL sets the first step of the rebuild, which copies the rows
+// through a temporary table.
+func (p *alterTablePlan) setRebuildSQL(server *Server, projection []contentdata.ProjectedColumn) error {
+	// A short fixed prefix and a random suffix keep the name bounded
+	// whatever the length of the table name.
+	tmpRef := &bigqueryv2.TableReference{ProjectId: p.ref.ProjectId, DatasetId: p.ref.DatasetId, TableId: alterTmpTablePrefix + randomID()}
+	sql, err := server.contentRepo.RebuildTableSQL(p.ref, tmpRef, projection)
+	if err != nil {
+		return err
+	}
+	p.tmpRef = tmpRef
+	p.sql = sql
+	return nil
+}
+
+func planRenameTable(ctx context.Context, server *Server, project *metadata.Project, plan *alterTablePlan, content *bigqueryv2.Table, newPath []string, projectID, datasetID string) (*alterTablePlan, error) {
 	ref := plan.ref
 	var path []string
 	for _, part := range newPath {
@@ -425,20 +803,429 @@ func planRenameTable(server *Server, project *metadata.Project, plan *alterTable
 	projection := make([]contentdata.ProjectedColumn, 0, len(content.Schema.Fields))
 	for _, field := range content.Schema.Fields {
 		projection = append(projection, contentdata.ProjectedColumn{Expr: quoteIdent(field.Name), Name: field.Name})
-	}
-	sql, err := server.contentRepo.RebuildTableSQL(ref, newRef, "", projection)
-	if err != nil {
-		return nil, err
+		copied, err := copyFieldSchema(field)
+		if err != nil {
+			return nil, err
+		}
+		plan.columns = append(plan.columns, &alterColumn{name: field.Name, expr: quoteIdent(field.Name), oldField: field, field: copied})
 	}
 	plan.newRef = newRef
-	plan.sql = sql
+	if err := plan.checkDefaults(ctx, server, projectID, datasetID); err != nil {
+		return nil, err
+	}
+	if err := plan.setRebuildSQL(server, projection); err != nil {
+		return nil, err
+	}
+	plan.changed = true
 	return plan, nil
 }
 
-// applyMetadata updates the table metadata after the rewritten script of the
-// plan committed. cat is the catalog change of that script.
+// alterFinishHook, when set by a test, may rewrite the second step of a
+// rebuild, e.g. to make it fail after the first step ran.
+var alterFinishHook struct {
+	mu sync.Mutex
+	fn func(sql string) string
+}
+
+func setAlterFinishHook(fn func(sql string) string) {
+	alterFinishHook.mu.Lock()
+	defer alterFinishHook.mu.Unlock()
+	alterFinishHook.fn = fn
+}
+
+func runAlterFinishHook(sql string) string {
+	alterFinishHook.mu.Lock()
+	hook := alterFinishHook.fn
+	alterFinishHook.mu.Unlock()
+	if hook == nil {
+		return sql
+	}
+	return hook(sql)
+}
+
+// run runs the rebuild of the plan inside tx. The first step copies the rows
+// into the temporary table and drops the table. googlesqlite reports the
+// dropped table's spec, with the NOT NULL and DEFAULT constraints it applies,
+// from which the second step creates the final table with the same
+// constraints and copies the rows back.
+//
+// Everything that can be checked is checked while planning, since a failure
+// after the first step leaves googlesqlite's in-memory catalog without the
+// table when the transaction is rolled back (goccy/googlesqlite#104); the
+// caller must then call repairCatalog.
+func (p *alterTablePlan) run(ctx context.Context, server *Server, tx *connection.Tx, projectID, datasetID string, params []*bigqueryv2.QueryParameter) (*internaltypes.QueryResponse, error) {
+	first, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, p.sql, params)
+	if first != nil && first.ChangedCatalog != nil && first.ChangedCatalog.Table != nil {
+		changed := first.ChangedCatalog.Table
+		p.srcSpec = findTableSpec(changed.Deleted, p.ref)
+		p.tmpAdded = findTableSpec(append(append([]*googlesqlite.TableSpec{}, changed.Added...), changed.Updated...), p.tmpRef) != nil
+	}
+	if err != nil {
+		return first, err
+	}
+	finish, err := p.finishSQL(ctx, server, first.ChangedCatalog)
+	if err != nil {
+		return nil, err
+	}
+	second, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, runAlterFinishHook(finish), params)
+	if p.newRef != nil && second != nil && second.ChangedCatalog != nil && second.ChangedCatalog.Table != nil {
+		changed := second.ChangedCatalog.Table
+		p.newRefAdded = findTableSpec(append(append([]*googlesqlite.TableSpec{}, changed.Added...), changed.Updated...), p.newRef) != nil
+	}
+	if err != nil {
+		return second, err
+	}
+	second.ChangedCatalog = mergeChangedCatalogs(first.ChangedCatalog, second.ChangedCatalog)
+	return second, nil
+}
+
+// finishSQL returns the second step of the rebuild. cat is the catalog change
+// of the first step.
+//
+// A column keeps the NOT NULL googlesqlite enforces on it, unless the
+// statement drops it, so that a table never becomes stricter than it was:
+// a REQUIRED column of a table created by tables.insert has no NOT NULL in
+// SQLite and may hold NULLs. Likewise a column keeps its DEFAULT only if
+// googlesqlite applies one; its expression is the defaultValueExpression of
+// the metadata, since googlesqlite stores only its internal form.
+func (p *alterTablePlan) finishSQL(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog) (string, error) {
+	var tmp *googlesqlite.TableSpec
+	if cat != nil && cat.Table != nil {
+		tmp = findTableSpec(append(append([]*googlesqlite.TableSpec{}, cat.Table.Added...), cat.Table.Updated...), p.tmpRef)
+	}
+	if tmp == nil || len(tmp.Columns) != len(p.columns) {
+		return "", fmt.Errorf("columns of the rebuilt table %s are unknown", p.ref.TableId)
+	}
+	columnTypes := make([]*googlesqlite.ColumnType, 0, len(tmp.Columns))
+	for _, c := range tmp.Columns {
+		columnTypes = append(columnTypes, c.Type)
+	}
+	defs, ok := p.columnDefinitions(ctx, columnTypes, p.srcSpec, true)
+	if !ok {
+		// CREATE TABLE ... AS SELECT copies any column type, but drops the
+		// constraints.
+		logger.Logger(ctx).Warn("ALTER TABLE drops the NOT NULL and DEFAULT constraints of a table: the emulator cannot express the type of one of its columns",
+			zap.String("table", p.ref.TableId))
+		defs = nil
+	}
+	return server.contentRepo.FinishRebuildTableSQL(p.tmpRef, p.dstRef(), defs)
+}
+
+// columnDefinitions returns the definitions of the columns of the plan, of
+// the given types, with the constraints src reports. after selects the
+// columns after the statement; otherwise they are the columns of the table
+// before it, for repairCatalog. It reports false when a type cannot be
+// expressed.
+func (p *alterTablePlan) columnDefinitions(ctx context.Context, columnTypes []*googlesqlite.ColumnType, src *googlesqlite.TableSpec, after bool) ([]contentdata.ColumnDefinition, bool) {
+	defs := make([]contentdata.ColumnDefinition, 0, len(columnTypes))
+	for i, columnType := range columnTypes {
+		var column *alterColumn
+		var name string
+		if after {
+			column = p.columns[i]
+			name = column.name
+		} else {
+			name = src.Columns[i].Name
+			for _, c := range p.columns {
+				if c.oldField != nil && strings.EqualFold(c.oldField.Name, name) {
+					column = c
+					break
+				}
+			}
+		}
+		def := contentdata.ColumnDefinition{Name: name}
+		typ, ok := contentdata.FieldDDLType(types.TableFieldSchemaFromColumnType(name, columnType))
+		if !ok {
+			return nil, false
+		}
+		def.Type = typ
+		var srcColumn *googlesqlite.ColumnSpec
+		if column != nil && column.oldField != nil && src != nil {
+			for _, c := range src.Columns {
+				if strings.EqualFold(c.Name, column.oldField.Name) {
+					srcColumn = c
+					break
+				}
+			}
+		}
+		if srcColumn != nil && srcColumn.IsNotNull && (!after || !column.dropNotNull) {
+			def.NotNull = true
+		}
+		switch {
+		case after && column.defaultSet:
+			def.Default = column.defaultText
+		case srcColumn != nil && srcColumn.DefaultExpr != "":
+			if column.keepDefault {
+				def.Default = column.oldField.DefaultValueExpression
+			} else if after {
+				logger.Logger(ctx).Warn("the DEFAULT of a column is dropped by ALTER TABLE: the table metadata has no valid expression for it",
+					zap.String("table", p.ref.TableId), zap.String("column", name))
+			}
+		}
+		defs = append(defs, def)
+	}
+	return defs, true
+}
+
+// checkDefaults checks, before anything runs, the DEFAULT expressions the
+// rebuild may give to the columns: a SET DEFAULT of the statement, which
+// fails the statement if it is invalid, and the defaultValueExpression of
+// the metadata, which is dropped with a warning if it is invalid (it can
+// come from the tables.insert and tables.patch input).
+func (p *alterTablePlan) checkDefaults(ctx context.Context, server *Server, projectID, datasetID string) error {
+	for _, column := range p.columns {
+		if column.oldField == nil {
+			continue
+		}
+		var typ string
+		if column.newType != nil {
+			typ = column.newType.name
+		} else if t, ok := contentdata.FieldDDLType(column.field); ok {
+			typ = t
+		}
+		if column.defaultSet {
+			if column.defaultText == "" {
+				continue
+			}
+			if typ == "" {
+				return fmt.Errorf("ALTER TABLE ALTER COLUMN SET DEFAULT is not supported by the emulator for column %s of type %s", column.name, column.field.Type)
+			}
+			if err := checkDefaultExpr(ctx, server, projectID, datasetID, column.name, typ, column.defaultText); err != nil {
+				return err
+			}
+			continue
+		}
+		text := column.oldField.DefaultValueExpression
+		if text == "" || typ == "" {
+			continue
+		}
+		if err := checkDefaultExpr(ctx, server, projectID, datasetID, column.name, typ, text); err != nil {
+			// The rebuilt table has no such DEFAULT, so the metadata
+			// stops advertising it.
+			logger.Logger(ctx).Warn("invalid defaultValueExpression in the table metadata is removed by ALTER TABLE",
+				zap.String("table", p.ref.TableId), zap.String("column", column.name), zap.Error(err))
+			column.field.DefaultValueExpression = ""
+			continue
+		}
+		column.keepDefault = true
+	}
+	return nil
+}
+
+// checkDefaultExpr checks that text is an expression that can be the
+// DEFAULT of a column of type typ: an expression whose type can be assigned
+// to the column. It runs read-only queries on a transaction of its own.
+func checkDefaultExpr(ctx context.Context, server *Server, projectID, datasetID, column, typ, text string) error {
+	if err := validateDefaultExpression(text); err != nil {
+		return fmt.Errorf("Invalid default value expression for column %s: %w", column, err)
+	}
+	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	// The queries only analyze the expression: LIMIT 0 and IF(FALSE, ...)
+	// keep it from being evaluated, so that e.g. DEFAULT ERROR('x') is
+	// accepted as in BigQuery, which fails only the INSERT. The closing
+	// parenthesis is on a line of its own, so that a trailing line comment
+	// cannot comment it out.
+	response, err := server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT (%s\n) AS v LIMIT 0", text), nil)
+	if err != nil {
+		return fmt.Errorf("Invalid default value expression for column %s: %w", column, translateQueryError(err, projectID, nil))
+	}
+	exprType := "unknown"
+	if len(response.Schema.Fields) == 1 {
+		if t, ok := contentdata.FieldDDLType(response.Schema.Fields[0]); ok {
+			exprType = t
+		}
+	}
+	notAssignable := fmt.Errorf("Invalid default value expression for column %s: an expression of type %s cannot be assigned to a column of type %s", column, exprType, typ)
+	// IF takes the common supertype of its branches; the expression is
+	// assignable when that type is the column's type. Literals are
+	// coerced, e.g. '2024-01-01' to a DATE column.
+	response, err = server.contentRepo.Query(ctx, tx, projectID, datasetID, fmt.Sprintf("SELECT IF(FALSE, CAST(NULL AS %s), (%s\n)) AS v LIMIT 0", typ, text), nil)
+	if err != nil || len(response.Schema.Fields) != 1 {
+		return notAssignable
+	}
+	if got, ok := contentdata.FieldDDLType(response.Schema.Fields[0]); !ok || got != typ {
+		return notAssignable
+	}
+	return nil
+}
+
+// repairCatalog brings googlesqlite's in-memory catalog back in line with
+// the tables after a rebuild was rolled back: the rollback restores SQLite
+// and the stored specs, but not the in-memory catalog (goccy/googlesqlite#104).
+// It undoes only what the steps of the rebuild reported: a step that failed
+// before changing the catalog left it correct, and rewriting a spec then
+// would lose constraints. Failures are logged: the statement already failed
+// with its own error.
+//
+// TODO(googlesqlite): roll back the in-memory catalog with the transaction
+// (goccy/googlesqlite#104). Remove this once it does.
+func (p *alterTablePlan) repairCatalog(ctx context.Context, server *Server) {
+	if p == nil || p.srcSpec == nil && !p.tmpAdded && !p.newRefAdded {
+		return
+	}
+	if err := p.restoreCatalog(ctx, server); err != nil {
+		logger.Logger(ctx).Error("failed to repair the analyzer catalog after a failed ALTER TABLE",
+			zap.String("table", p.ref.TableId), zap.Error(err))
+	}
+}
+
+func (p *alterTablePlan) restoreCatalog(ctx context.Context, server *Server) error {
+	conn, err := server.connMgr.Connection(ctx, p.ref.ProjectId, p.ref.DatasetId)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	// Forget the tables the rolled-back rebuild created. Their SQLite
+	// tables are gone, so this only drops their specs.
+	var created []*bigqueryv2.TableReference
+	if p.tmpAdded {
+		created = append(created, p.tmpRef)
+	}
+	if p.newRefAdded {
+		created = append(created, p.newRef)
+	}
+	for _, ref := range created {
+		path, err := server.contentRepo.TablePath(ref.ProjectId, ref.DatasetId, ref.TableId)
+		if err != nil {
+			return err
+		}
+		if _, err := server.contentRepo.Query(ctx, tx, ref.ProjectId, ref.DatasetId, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", path), nil); err != nil {
+			return err
+		}
+	}
+	// Register the dropped table again, with the constraints googlesqlite
+	// reported for it.
+	if src := p.srcSpec; src != nil {
+		columnTypes := make([]*googlesqlite.ColumnType, 0, len(src.Columns))
+		for _, c := range src.Columns {
+			columnTypes = append(columnTypes, c.Type)
+		}
+		defs, ok := p.columnDefinitions(ctx, columnTypes, src, false)
+		if !ok || len(defs) == 0 {
+			return fmt.Errorf("the emulator cannot express the columns of the table")
+		}
+		sql, err := server.contentRepo.RestoreTableSpecSQL(p.ref, defs)
+		if err != nil {
+			return err
+		}
+		if _, err := server.contentRepo.Query(ctx, tx, p.ref.ProjectId, p.ref.DatasetId, sql, nil); err != nil {
+			return err
+		}
+	}
+	if err := server.contentRepo.RefreshCatalog(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// validateDefaultExpression checks that text is a single expression before
+// it is spliced into a CREATE TABLE statement. defaultValueExpression can
+// come from the tables.insert and tables.patch input.
+func validateDefaultExpression(text string) error {
+	opts, err := newDDLParserOptions()
+	if err != nil {
+		return err
+	}
+	out, err := googlesql.ParseExpression(text, opts)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return fmt.Errorf("not an expression")
+	}
+	expr, err := out.Expression()
+	if err != nil || expr == nil {
+		return fmt.Errorf("not an expression")
+	}
+	if containsSubquery(expr) {
+		return fmt.Errorf("a subquery is not allowed in a default value expression")
+	}
+	return nil
+}
+
+func containsSubquery(node googlesql.ASTNode) bool {
+	switch node.(type) {
+	case *googlesql.ASTExpressionSubquery, *googlesql.ASTQuery:
+		return true
+	}
+	for _, child := range childNodes(node) {
+		if containsSubquery(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func findTableSpec(specs []*googlesqlite.TableSpec, ref *bigqueryv2.TableReference) *googlesqlite.TableSpec {
+	var found *googlesqlite.TableSpec
+	for _, spec := range specs {
+		if len(spec.NamePath) == 3 && spec.NamePath[0] == ref.ProjectId && spec.NamePath[1] == ref.DatasetId && spec.NamePath[2] == ref.TableId {
+			found = spec
+		}
+	}
+	return found
+}
+
+// mergeChangedCatalogs returns the catalog change of a followed by b, folding
+// a table dropped and created again into one change as googlesqlite does
+// within a script.
+func mergeChangedCatalogs(a, b *googlesqlite.ChangedCatalog) *googlesqlite.ChangedCatalog {
+	if a == nil || a.Table == nil {
+		return b
+	}
+	if b == nil || b.Table == nil {
+		return a
+	}
+	merged := &googlesqlite.ChangedCatalog{
+		Table: &googlesqlite.ChangedTable{
+			Added:   append([]*googlesqlite.TableSpec{}, a.Table.Added...),
+			Updated: append(append([]*googlesqlite.TableSpec{}, a.Table.Updated...), b.Table.Updated...),
+			Deleted: append([]*googlesqlite.TableSpec{}, a.Table.Deleted...),
+		},
+		Function: &googlesqlite.ChangedFunction{},
+	}
+	for _, f := range []*googlesqlite.ChangedFunction{a.Function, b.Function} {
+		if f != nil {
+			merged.Function.Added = append(merged.Function.Added, f.Added...)
+			merged.Function.Deleted = append(merged.Function.Deleted, f.Deleted...)
+		}
+	}
+	without := func(specs []*googlesqlite.TableSpec, name string) []*googlesqlite.TableSpec {
+		kept := specs[:0]
+		for _, spec := range specs {
+			if spec.TableName() != name {
+				kept = append(kept, spec)
+			}
+		}
+		return kept
+	}
+	for _, spec := range b.Table.Deleted {
+		merged.Table.Added = without(merged.Table.Added, spec.TableName())
+		merged.Table.Deleted = append(merged.Table.Deleted, spec)
+	}
+	for _, spec := range b.Table.Added {
+		merged.Table.Deleted = without(merged.Table.Deleted, spec.TableName())
+		merged.Table.Added = append(merged.Table.Added, spec)
+	}
+	return merged
+}
+
+// applyMetadata updates the table metadata after the job of the plan
+// committed. cat is the catalog change of the rebuild, if any.
 func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat *googlesqlite.ChangedCatalog) error {
-	if p.sql == "" {
+	if !p.changed {
 		return nil
 	}
 	tableName := fmt.Sprintf("%s:%s.%s", p.ref.ProjectId, p.ref.DatasetId, p.ref.TableId)
@@ -458,13 +1245,6 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 	if err != nil {
 		return err
 	}
-	var fields []*bigqueryv2.TableFieldSchema
-	if p.newRef == nil {
-		fields, err = p.newFields(cat)
-		if err != nil {
-			return fmt.Errorf("table %s: %w", tableName, err)
-		}
-	}
 
 	conn, err := server.connMgr.Connection(ctx, p.ref.ProjectId, p.ref.DatasetId)
 	if err != nil {
@@ -480,6 +1260,12 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 			ProjectId: p.newRef.ProjectId,
 			DatasetId: p.newRef.DatasetId,
 			TableId:   p.newRef.TableId,
+		}
+		// checkDefaults may have removed an invalid default.
+		if content.Schema != nil && len(content.Schema.Fields) == len(p.columns) {
+			for i, field := range content.Schema.Fields {
+				field.DefaultValueExpression = p.columns[i].field.DefaultValueExpression
+			}
 		}
 		if err := dataset.DeleteTable(ctx, tx.Tx(), p.ref.TableId); err != nil {
 			return err
@@ -503,61 +1289,92 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 				return err
 			}
 		}
-	} else {
-		encoded, err := json.Marshal(&bigqueryv2.Table{
-			Schema:           &bigqueryv2.TableSchema{Fields: fields},
-			LastModifiedTime: uint64(time.Now().Unix()),
-		})
-		if err != nil {
-			return err
+		return tx.Commit()
+	}
+	fields, err := p.newFields(cat)
+	if err != nil {
+		return fmt.Errorf("table %s: %w", tableName, err)
+	}
+	content.Schema = &bigqueryv2.TableSchema{Fields: fields}
+	for _, option := range p.options {
+		if err := applyTableOption(content, option); err != nil {
+			return fmt.Errorf("table %s: %w", tableName, err)
 		}
-		var patch map[string]interface{}
-		if err := json.Unmarshal(encoded, &patch); err != nil {
-			return err
+	}
+	if p.primaryKeySet {
+		if content.TableConstraints == nil {
+			content.TableConstraints = &bigqueryv2.TableConstraints{}
 		}
-		if err := table.Patch(ctx, tx.Tx(), patch); err != nil {
-			return err
+		content.TableConstraints.PrimaryKey = nil
+		if len(p.primaryKey) != 0 {
+			content.TableConstraints.PrimaryKey = &bigqueryv2.TableConstraintsPrimaryKey{Columns: p.primaryKey}
 		}
+		if content.TableConstraints.PrimaryKey == nil && len(content.TableConstraints.ForeignKeys) == 0 {
+			content.TableConstraints = nil
+		}
+	}
+	content.LastModifiedTime = uint64(time.Now().Unix())
+	// Replace rather than patch, so that the options set to NULL really
+	// disappear from the metadata.
+	encoded, err := json.Marshal(content)
+	if err != nil {
+		return err
+	}
+	var replacement map[string]interface{}
+	if err := json.Unmarshal(encoded, &replacement); err != nil {
+		return err
+	}
+	if err := table.Replace(ctx, tx.Tx(), replacement); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
 
-// newFields returns the schema of the table after a column change. Kept and
-// renamed columns keep their schema (description, mode, policy tags); added
-// columns take the type googlesqlite resolved for them.
+// newFields returns the schema of the table after the statement. Kept and
+// renamed columns keep their schema (description, mode, policy tags) with
+// the changes of the statement; added and retyped columns take the type
+// googlesqlite resolved for them.
 func (p *alterTablePlan) newFields(cat *googlesqlite.ChangedCatalog) ([]*bigqueryv2.TableFieldSchema, error) {
 	var spec *googlesqlite.TableSpec
-	if cat != nil && cat.Table != nil {
-		for _, s := range append(append([]*googlesqlite.TableSpec{}, cat.Table.Added...), cat.Table.Updated...) {
-			if len(s.NamePath) == 3 && p.skips(s.NamePath[0], s.NamePath[1], s.NamePath[2]) {
-				spec = s
-			}
-		}
+	if p.sql != "" && cat != nil && cat.Table != nil {
+		spec = findTableSpec(append(append([]*googlesqlite.TableSpec{}, cat.Table.Added...), cat.Table.Updated...), p.dstRef())
 	}
 	fields := make([]*bigqueryv2.TableFieldSchema, 0, len(p.columns))
 	for _, column := range p.columns {
-		if column.oldField != nil {
-			field, err := copyFieldSchema(column.oldField)
-			if err != nil {
-				return nil, err
-			}
-			field.Name = column.name
-			fields = append(fields, field)
+		if column.field != nil && column.newType == nil {
+			fields = append(fields, column.field)
 			continue
 		}
-		var added *googlesqlite.ColumnSpec
+		var resolved *googlesqlite.ColumnSpec
 		if spec != nil {
 			for _, c := range spec.Columns {
 				if strings.EqualFold(c.Name, column.name) {
-					added = c
+					resolved = c
 					break
 				}
 			}
 		}
-		if added == nil {
-			return nil, fmt.Errorf("type of added column %s is unknown", column.name)
+		if resolved == nil {
+			return nil, fmt.Errorf("type of column %s is unknown", column.name)
 		}
-		field := types.TableFieldSchemaFromColumnType(column.name, added.Type)
+		field := types.TableFieldSchemaFromColumnType(column.name, resolved.Type)
+		if column.field != nil {
+			// ALTER COLUMN SET DATA TYPE keeps everything but the type.
+			retyped := column.field
+			retyped.Type = field.Type
+			retyped.MaxLength, retyped.Precision, retyped.Scale = 0, 0, 0
+			switch params := column.newType.params; {
+			case len(params) == 1 && (column.newType.name == "STRING" || column.newType.name == "BYTES"):
+				retyped.MaxLength = params[0]
+			case len(params) >= 1 && (column.newType.name == "NUMERIC" || column.newType.name == "BIGNUMERIC"):
+				retyped.Precision = params[0]
+				if len(params) == 2 {
+					retyped.Scale = params[1]
+				}
+			}
+			fields = append(fields, retyped)
+			continue
+		}
 		column.annotation.apply(field, false)
 		fields = append(fields, field)
 	}
@@ -638,28 +1455,16 @@ func skipSpaceAndComments(query string) string {
 }
 
 // parseAlterTable parses query as a single ALTER TABLE statement. It reports
-// false when query is anything else, or uses an action that is left to
-// googlesqlite. An error is returned for a supported action that uses a
-// feature the rebuild cannot honour.
+// false when query is anything else or cannot be parsed, which leaves it to
+// googlesqlite. An error is returned for an action the emulator does not
+// support, or that uses a feature the emulator cannot honour.
 func parseAlterTable(query string) (*parsedAlterTable, bool, error) {
-	if err := googlesql.Init(); err != nil {
-		return nil, false, nil
-	}
-	languageOptions, err := googlesql.NewLanguageOptions()
-	if err != nil {
-		return nil, false, nil
-	}
-	// Parse DEFAULT, so that it is reported as unsupported instead of
-	// leaving the statement to googlesqlite's no-op.
-	if err := languageOptions.EnableLanguageFeature(googlesql.LanguageFeatureFeatureColumnDefaultValue); err != nil {
-		return nil, false, nil
-	}
-	opts, err := googlesql.NewParserOptions2(nil, nil, languageOptions)
+	opts, err := newDDLParserOptions()
 	if err != nil {
 		return nil, false, nil
 	}
 	out, err := googlesql.ParseStatement(query, opts)
-	if err != nil {
+	if err != nil || out == nil {
 		return nil, false, nil
 	}
 	node, err := out.Statement()
@@ -708,15 +1513,25 @@ func parseAlterTable(query string) (*parsedAlterTable, bool, error) {
 	return parsed, true, nil
 }
 
+// parseAlterAction parses one action. It reports false when the action is
+// shaped unexpectedly, and returns an error for an action the emulator does
+// not support.
 func parseAlterAction(query string, node googlesql.ASTAlterActionNode) (*alterAction, bool, error) {
+	unsupported := func() (*alterAction, bool, error) {
+		keyword, err := node.GetSQLForAlterAction()
+		if err != nil || keyword == "" {
+			keyword = "action"
+		}
+		return nil, false, fmt.Errorf("ALTER TABLE %s is not supported by the emulator", keyword)
+	}
 	switch node := node.(type) {
 	case *googlesql.ASTAddColumnAction:
 		// ADD COLUMN ... FIRST/AFTER and FILL USING are not BigQuery.
 		if position, err := node.ColumnPosition(); err != nil || position != nil {
-			return nil, false, nil
+			return nil, false, fmt.Errorf("ALTER TABLE ADD COLUMN: a column position is not supported by the emulator")
 		}
 		if fill, err := node.FillExpression(); err != nil || fill != nil {
-			return nil, false, nil
+			return nil, false, fmt.Errorf("ALTER TABLE ADD COLUMN: FILL USING is not supported by the emulator")
 		}
 		ifNotExists, err := node.IsIfNotExists()
 		if err != nil {
@@ -780,8 +1595,176 @@ func parseAlterAction(query string, node googlesql.ASTAlterActionNode) (*alterAc
 			return nil, false, nil
 		}
 		return &alterAction{kind: alterRenameTo, newPath: path}, true, nil
+	case *googlesql.ASTSetOptionsAction:
+		list, err := node.OptionsList()
+		if err != nil || list == nil {
+			return nil, false, nil
+		}
+		options, err := parseOptions(query, list)
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterSetTableOptions, options: options}, true, nil
+	case *googlesql.ASTAlterColumnOptionsAction:
+		name, ok := identifierString(node.ColumnName())
+		if !ok {
+			return nil, false, nil
+		}
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		list, err := node.OptionsList()
+		if err != nil || list == nil {
+			return nil, false, nil
+		}
+		options, err := parseOptions(query, list)
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterSetColumnOptions, name: name, ifExists: ifExists, options: options}, true, nil
+	case *googlesql.ASTAlterColumnDropNotNullAction:
+		name, ok := identifierString(node.ColumnName())
+		if !ok {
+			return nil, false, nil
+		}
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterDropNotNull, name: name, ifExists: ifExists}, true, nil
+	case *googlesql.ASTAlterColumnTypeAction:
+		name, ok := identifierString(node.ColumnName())
+		if !ok {
+			return nil, false, nil
+		}
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		if collate, err := node.Collate(); err != nil || collate != nil {
+			return nil, false, fmt.Errorf("ALTER TABLE ALTER COLUMN SET DATA TYPE: COLLATE is not supported by the emulator")
+		}
+		schema, err := node.Schema()
+		if err != nil || schema == nil {
+			return nil, false, nil
+		}
+		newType, err := simpleColumnType(schema)
+		if err != nil {
+			return nil, false, err
+		}
+		return &alterAction{kind: alterSetDataType, name: name, ifExists: ifExists, newType: newType}, true, nil
+	case *googlesql.ASTAlterColumnSetDefaultAction:
+		name, ok := identifierString(node.ColumnName())
+		if !ok {
+			return nil, false, nil
+		}
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		def, err := node.DefaultExpression()
+		if err != nil || def == nil {
+			return nil, false, nil
+		}
+		text, ok := sourceText(query, def)
+		if !ok {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterSetDefault, name: name, ifExists: ifExists, defaultText: text}, true, nil
+	case *googlesql.ASTAlterColumnDropDefaultAction:
+		name, ok := identifierString(node.ColumnName())
+		if !ok {
+			return nil, false, nil
+		}
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterDropDefault, name: name, ifExists: ifExists}, true, nil
+	case *googlesql.ASTAddConstraintAction:
+		constraint, err := node.Constraint()
+		if err != nil || constraint == nil {
+			return nil, false, nil
+		}
+		key, ok := constraint.(*googlesql.ASTPrimaryKey)
+		if !ok {
+			return unsupported()
+		}
+		if name, err := key.ConstraintName(); err != nil || name != nil {
+			return nil, false, fmt.Errorf("ALTER TABLE ADD CONSTRAINT: a named PRIMARY KEY is not supported by the emulator")
+		}
+		enforced, err := key.Enforced()
+		if err != nil {
+			return nil, false, nil
+		}
+		if enforced {
+			return nil, false, fmt.Errorf("PRIMARY KEY must be NOT ENFORCED")
+		}
+		columns, ok := primaryKeyColumns(key)
+		if !ok {
+			return nil, false, nil
+		}
+		ifNotExists, err := node.IsIfNotExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterAddPrimaryKey, columns: columns, ifExists: ifNotExists}, true, nil
+	case *googlesql.ASTDropPrimaryKeyAction:
+		ifExists, err := node.IsIfExists()
+		if err != nil {
+			return nil, false, nil
+		}
+		return &alterAction{kind: alterDropPrimaryKey, ifExists: ifExists}, true, nil
 	}
-	return nil, false, nil
+	return unsupported()
+}
+
+// simpleColumnType returns the type of an ALTER COLUMN SET DATA TYPE
+// schema, which must be a simple type without attributes.
+func simpleColumnType(schema googlesql.ASTColumnSchemaNode) (*columnTypeName, error) {
+	unsupported := func(feature string) error {
+		return fmt.Errorf("ALTER TABLE ALTER COLUMN SET DATA TYPE: %s is not supported by the emulator", feature)
+	}
+	simple, ok := schema.(*googlesql.ASTSimpleColumnSchema)
+	if !ok {
+		return nil, unsupported("this type")
+	}
+	if def, err := schema.DefaultExpression(); err != nil || def != nil {
+		return nil, unsupported("DEFAULT")
+	}
+	if collate, err := schema.Collate(); err != nil || collate != nil {
+		return nil, unsupported("COLLATE")
+	}
+	if options, err := schema.OptionsList(); err != nil || options != nil {
+		return nil, unsupported("OPTIONS")
+	}
+	if attributes, err := schema.Attributes(); err != nil || attributes != nil {
+		return nil, unsupported("a column attribute")
+	}
+	typeName, err := simple.TypeName()
+	if err != nil || typeName == nil {
+		return nil, unsupported("this type")
+	}
+	name, ok := singleName(typeName)
+	if !ok {
+		return nil, unsupported("this type")
+	}
+	t := &columnTypeName{name: canonicalTypeName(name)}
+	if params, err := simple.TypeParameters(); err == nil && params != nil {
+		for _, param := range childNodes(params) {
+			v, ok := decodeOptionLiteral(param)
+			if !ok {
+				return nil, unsupported("this type parameter")
+			}
+			i, ok := v.(int64)
+			if !ok {
+				return nil, unsupported("this type parameter")
+			}
+			t.params = append(t.params, i)
+		}
+	}
+	return t, nil
 }
 
 func identifierString(ident *googlesql.ASTIdentifier, err error) (string, bool) {

@@ -1220,7 +1220,7 @@ func (h *jobsGetQueryResultsHandler) ServeHTTP(w http.ResponseWriter, r *http.Re
 		startIndex:        startIndex,
 	})
 	if err != nil {
-		errorResponse(ctx, w, errJobInternalError(err.Error()))
+		errorResponse(ctx, w, jobResultError(job, err))
 		return
 	}
 	encodeResponse(ctx, w, res)
@@ -1749,14 +1749,20 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		alterPlan *alterTablePlan
 		planErr   error
 	)
-	if !job.Configuration.DryRun && looksLikeAlter(queryText) {
+	// Check the DDL before the job transaction starts: checkDatasets reads
+	// the metadata through another connection.
+	ddl, planErr := analyzeDDL(queryText, queryProjectID, datasetID)
+	if planErr == nil {
+		planErr = ddl.checkDatasets(ctx, r.server)
+	}
+	if planErr == nil && !job.Configuration.DryRun && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
 		// ALTER TABLE statements must not interleave.
 		r.server.alterMu.Lock()
 		defer r.server.alterMu.Unlock()
 		// Plan before the job transaction starts: planning reads the
 		// metadata through another connection.
-		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText, job.Configuration.Query.QueryParameters)
 		runAlterBeforeRebuildHook(alterPlan)
 	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
@@ -1782,14 +1788,8 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if jobErr = alterPlan.checkUnchanged(ctx, r.server, tx); jobErr != nil {
 			break
 		}
-		response, jobErr = r.server.contentRepo.Query(
-			ctx,
-			tx,
-			queryProjectID,
-			datasetID,
-			alterPlan.sql,
-			job.Configuration.Query.QueryParameters,
-		)
+		response, jobErr = alterPlan.run(ctx, r.server, tx, queryProjectID, datasetID, job.Configuration.Query.QueryParameters)
+		jobErr = translateQueryError(jobErr, queryProjectID, ddl)
 	default:
 		// On error, response may carry the catalog changes of the
 		// statements that ran before the failure.
@@ -1801,6 +1801,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			queryText,
 			job.Configuration.Query.QueryParameters,
 		)
+		jobErr = translateQueryError(jobErr, queryProjectID, ddl)
 	}
 	endTime := time.Now()
 	if job.JobReference.JobId == "" {
@@ -1871,9 +1872,8 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	)
 	status := &bigqueryv2.JobStatus{State: "DONE"}
 	if jobErr != nil {
-		internalErr := errJobInternalError(jobErr.Error())
-		status.ErrorResult = internalErr.ErrorProto()
-		status.Errors = []*bigqueryv2.ErrorProto{internalErr.ErrorProto()}
+		status.ErrorResult = jobErrorProto(jobErr)
+		status.Errors = []*bigqueryv2.ErrorProto{jobErrorProto(jobErr)}
 	}
 	job.Status = status
 	var totalBytes int64
@@ -1902,6 +1902,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		// ALTER TABLE is atomic: discard what the failed rebuild did and
 		// record only the job.
 		_ = tx.RollbackIfNotCommitted()
+		alterPlan.repairCatalog(ctx, r.server)
 		syncResponse = nil
 		conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 		if err != nil {
@@ -1922,7 +1923,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			job.JobReference.JobId,
 			job,
 			jobResponse,
-			jobErr,
+			storedJobError(jobErr),
 		),
 	); err != nil {
 		return nil, fmt.Errorf("failed to add job: %w", err)
@@ -1935,7 +1936,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, syncResponse, alterPlan, jobErr); err != nil {
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, syncResponse, alterPlan, ddl, jobErr); err != nil {
 			return nil, err
 		}
 	}
@@ -1954,8 +1955,9 @@ func emptyDDLResponse() *internaltypes.QueryResponse {
 // syncQueryCatalog updates the table metadata and googlesqlite's analyzer
 // catalog after a query committed. response may be a partial response of a
 // failed query (queryErr != nil); an error while syncing it is then only
-// logged, so that it does not hide the query's own error.
-func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID string, response *internaltypes.QueryResponse, plan *alterTablePlan, queryErr error) error {
+// logged, so that it does not hide the query's own error. ddl is the analysis
+// of the query's text, and params its parameters.
+func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID string, params []*bigqueryv2.QueryParameter, response *internaltypes.QueryResponse, plan *alterTablePlan, ddl *ddlInfo, queryErr error) error {
 	if response == nil {
 		return nil
 	}
@@ -1963,8 +1965,14 @@ func syncQueryCatalog(ctx context.Context, server *Server, projectID, datasetID 
 	if plan != nil && plan.sql != "" {
 		skip = plan.skips
 	}
-	res, err := syncCatalog(ctx, server, response.ChangedCatalog, skip)
-	if err == nil && skip != nil && queryErr == nil {
+	if cat := response.ChangedCatalog; ddl != nil && cat != nil && cat.Table != nil && len(cat.Table.Added)+len(cat.Table.Updated) != 0 {
+		// The job committed, so the evaluation can use the database.
+		for _, create := range ddl.creates {
+			create.evalOptions(ctx, server, projectID, datasetID, params)
+		}
+	}
+	res, err := syncCatalog(ctx, server, response.ChangedCatalog, skip, ddl)
+	if err == nil && plan != nil && plan.changed && queryErr == nil {
 		err = plan.applyMetadata(ctx, server, response.ChangedCatalog)
 	}
 	if err != nil {
@@ -2109,7 +2117,9 @@ func (h *jobsQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		useInt64Timestamp: useInt64Timestamp,
 	})
 	if err != nil {
-		errorResponse(ctx, w, errJobInternalError(err.Error()))
+		// Keep the status of a typed error, e.g. 409 for CREATE TABLE on
+		// an existing table.
+		errorResponse(ctx, w, queryServerError(err))
 		return
 	}
 	encodeResponse(ctx, w, res)
@@ -2130,14 +2140,20 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		alterPlan *alterTablePlan
 		planErr   error
 	)
-	if !r.queryRequest.DryRun && looksLikeAlter(queryText) {
+	// Check the DDL before the transaction starts: checkDatasets reads the
+	// metadata through another connection.
+	ddl, planErr := analyzeDDL(queryText, queryProjectID, datasetID)
+	if planErr == nil {
+		planErr = ddl.checkDatasets(ctx, r.server)
+	}
+	if planErr == nil && !r.queryRequest.DryRun && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
 		// ALTER TABLE statements must not interleave.
 		r.server.alterMu.Lock()
 		defer r.server.alterMu.Unlock()
 		// Plan before the transaction starts: planning reads the metadata
 		// through another connection.
-		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText)
+		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText, r.queryRequest.QueryParameters)
 		runAlterBeforeRebuildHook(alterPlan)
 	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
@@ -2164,14 +2180,8 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if queryErr = alterPlan.checkUnchanged(ctx, r.server, tx); queryErr != nil {
 			break
 		}
-		response, queryErr = r.server.contentRepo.Query(
-			ctx,
-			tx,
-			queryProjectID,
-			datasetID,
-			alterPlan.sql,
-			r.queryRequest.QueryParameters,
-		)
+		response, queryErr = alterPlan.run(ctx, r.server, tx, queryProjectID, datasetID, r.queryRequest.QueryParameters)
+		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
 	default:
 		response, queryErr = r.server.contentRepo.Query(
 			ctx,
@@ -2181,6 +2191,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 			queryText,
 			r.queryRequest.QueryParameters,
 		)
+		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
 	}
 	if queryErr != nil {
 		// Keep what the statements before the failure did, as jobs.insert
@@ -2192,8 +2203,12 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 			if err := tx.Commit(); err != nil {
 				logger.Logger(ctx).Error("failed to commit a failed query", zap.Error(err))
 			} else {
-				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, response, alterPlan, queryErr)
+				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, alterPlan, ddl, queryErr)
 			}
+		}
+		if alterPlan != nil {
+			_ = tx.RollbackIfNotCommitted()
+			alterPlan.repairCatalog(ctx, r.server)
 		}
 		return nil, queryErr
 	}
@@ -2279,7 +2294,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, response, alterPlan, nil); err != nil {
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, alterPlan, ddl, nil); err != nil {
 			return nil, err
 		}
 	}
