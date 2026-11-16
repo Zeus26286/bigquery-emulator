@@ -83,16 +83,27 @@ tests: `TestCreateOrReplaceTableSyncsCatalog`,
 `TestCreateTableIfNotExistsKeepsExistingTable`, `TestAlterTableSyncsCatalog`,
 `TestAlterTableEdgeCases`, `TestFailedScriptSyncsCatalog`.
 
+`CREATE TABLE ... LIKE` and `ALTER TABLE` at the top level of a
+multi-statement script run at their place in the script, through a statement
+handler that the emulator registers with googlesqlite (requires the
+`RegisterStatementHandler` API of the
+[Zeus26286/googlesqlite](https://github.com/Zeus26286/googlesqlite) fork,
+branch `feat/statement-handler`). Regression tests:
+`TestScriptCreateTableLikeAndAlterTable`, `TestAlterRebuildFailureKeepsTable`.
+
 Still needing googlesqlite fixes:
-- `ALTER` inside a multi-statement script is rejected with an explicit error.
+- `ALTER` and `CREATE TABLE ... LIKE` inside a block of a script (`IF`,
+  `LOOP`, `BEGIN ... END`, ...) are rejected with an explicit error, since
+  googlesqlite does not run the statements of a block.
 - A failure before a script's last statement leaves metadata stale until the
   next DDL on that table.
 - After `CREATE OR REPLACE`, later statements in the same script see the old
   columns.
-- `CREATE TABLE ... LIKE` is rejected by googlesqlite
+- `CREATE TABLE ... LIKE` is rejected by upstream googlesqlite
   ([goccy/googlesqlite#74](https://github.com/goccy/googlesqlite/issues/74),
   PR [goccy/googlesqlite#75](https://github.com/goccy/googlesqlite/pull/75));
-  the emulator runs a standalone one itself and rejects it inside a script.
+  the fork enables it, and the emulator runs it itself in any case, so that
+  it copies the metadata.
 
 ### 4. ⬜ Invalid queries reported as `jobInternalError` — [#316](https://github.com/goccy/bigquery-emulator/issues/316)
 

@@ -117,7 +117,7 @@ func TestDDLMetadata(t *testing.T) {
 		{"create_in_script", testCreateTableMetadataInScript},
 		{"create_requires_dataset", testCreateTableRequiresDataset},
 		{"not_null_violation", testNotNullViolationMessage},
-		{"alter_in_script_rejected", testAlterTableInScriptRejected},
+		{"alter_in_block_rejected", testAlterTableInBlockRejected},
 		{"alter_set_options", testAlterTableSetOptions},
 		{"alter_column_actions", testAlterColumnActions},
 		{"alter_primary_key", testAlterTablePrimaryKey},
@@ -448,12 +448,10 @@ func testTableNotFoundSuggestion(t *testing.T, env *ddlTestEnv) {
 	}
 }
 
-func testAlterTableInScriptRejected(t *testing.T, env *ddlTestEnv, mode, ds string) {
-	const want = "ALTER TABLE inside a multi-statement script is not supported by the emulator"
+func testAlterTableInBlockRejected(t *testing.T, env *ddlTestEnv, mode, ds string) {
+	const want = "ALTER TABLE inside a block of a multi-statement script is not supported by the emulator"
 	env.mustExec(t, mode, "CREATE TABLE "+ds+".sc (a INT64)")
 	for _, sql := range []string{
-		"ALTER TABLE " + ds + ".sc ADD COLUMN b STRING; SELECT 1",
-		"SELECT 1; ALTER TABLE " + ds + ".sc ADD COLUMN b STRING",
 		"BEGIN ALTER TABLE " + ds + ".sc ADD COLUMN b STRING; END",
 		"IF TRUE THEN ALTER TABLE " + ds + ".sc ADD COLUMN b STRING; END IF",
 	} {
@@ -821,7 +819,7 @@ func testCreateTableLikeErrors(t *testing.T, env *ddlTestEnv) {
 			}
 		}
 		assertErrContains(t, env.exec(t, mode, "CREATE TABLE dataset1.lx LIKE dataset1.lev"), "not supported by the emulator for view test:dataset1.lev")
-		assertErrContains(t, env.exec(t, mode, "SELECT 1; CREATE TABLE dataset1.lx LIKE dataset1.le"), "CREATE TABLE ... LIKE inside a multi-statement script is not supported by the emulator")
+		assertErrContains(t, env.exec(t, mode, "IF TRUE THEN CREATE TABLE dataset1.lx LIKE dataset1.le; END IF"), "CREATE TABLE ... LIKE inside a block of a multi-statement script is not supported by the emulator")
 		assertErrContains(t, env.execIn(t, mode, "", "CREATE TABLE lx LIKE dataset1.le"), `Table "lx" must be qualified with a dataset (e.g. dataset.table).`)
 		env.assertTableNotFound(t, "dataset1", "lx")
 

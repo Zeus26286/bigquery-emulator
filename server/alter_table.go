@@ -37,14 +37,15 @@ import (
 // table metadata is then updated from the plan, so that column descriptions
 // and modes survive the rebuild.
 //
-// ALTER TABLE inside a multi-statement script is rejected (analyzeDDL).
-// ALTER TABLE statements are serialized (Server.alterMu) because the plan is
+// Inside a multi-statement script, the same plan runs in a googlesqlite
+// statement handler (script_ddl.go); inside a block of a script, ALTER TABLE
+// is rejected (analyzeDDL). ALTER TABLE statements are serialized (Server.alterMu) because the plan is
 // built from the metadata before the rebuild runs, and checkUnchanged guards
 // the rebuild against any other concurrent change.
 //
-// TODO(googlesqlite): implement ALTER TABLE and report it through
-// ChangedCatalog.Table.Updated (no upstream issue yet; googlesqlite runs
-// ALTER TABLE as a no-op). Once it does, this file can be removed.
+// googlesqlite only analyzes ALTER TABLE: the metadata of the emulator
+// (descriptions, partitioning, ...) is beyond its catalog, so the emulator
+// keeps running the statement itself.
 
 // alterTablePlan is a standalone ALTER TABLE statement rewritten into a
 // table rebuild and a metadata update.
@@ -411,7 +412,7 @@ func planAlterTable(ctx context.Context, server *Server, defaultProjectID, defau
 	}
 	tableName := fmt.Sprintf("%s:%s.%s", ref.ProjectId, ref.DatasetId, ref.TableId)
 
-	project, err := server.metaRepo.FindProject(ctx, ref.ProjectId)
+	project, err := findProjectForDDL(ctx, server, ref.ProjectId)
 	if err != nil {
 		return nil, err
 	}
@@ -1019,11 +1020,7 @@ func checkDefaultExpr(ctx context.Context, server *Server, projectID, datasetID,
 	if err := validateDefaultExpression(text); err != nil {
 		return fmt.Errorf("Invalid default value expression for column %s: %w", column, err)
 	}
-	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
+	tx, err := beginDDLTx(ctx, server, projectID, datasetID)
 	if err != nil {
 		return err
 	}
@@ -1229,7 +1226,7 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 		return nil
 	}
 	tableName := fmt.Sprintf("%s:%s.%s", p.ref.ProjectId, p.ref.DatasetId, p.ref.TableId)
-	project, err := server.metaRepo.FindProject(ctx, p.ref.ProjectId)
+	project, err := findProjectForDDL(ctx, server, p.ref.ProjectId)
 	if err != nil {
 		return err
 	}
@@ -1246,11 +1243,7 @@ func (p *alterTablePlan) applyMetadata(ctx context.Context, server *Server, cat 
 		return err
 	}
 
-	conn, err := server.connMgr.Connection(ctx, p.ref.ProjectId, p.ref.DatasetId)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
+	tx, err := beginDDLTx(ctx, server, p.ref.ProjectId, p.ref.DatasetId)
 	if err != nil {
 		return err
 	}

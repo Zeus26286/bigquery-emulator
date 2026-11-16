@@ -477,6 +477,33 @@ func TestAlterRebuildFailureKeepsTable(t *testing.T) {
 		})
 	}
 
+	// Inside a script, the failed ALTER TABLE is rolled back while the
+	// statement before it is kept, and the statement after it does not run.
+	for _, mode := range []string{"jobs.insert", "jobs.query"} {
+		t.Run("second_step_fails_in_script/"+mode, func(t *testing.T) {
+			table := "rbsc_" + strings.ReplaceAll(mode, ".", "_")
+			env.mustExec(t, "CREATE TABLE dataset1."+table+" (a INT64 NOT NULL, b STRING DEFAULT 'q')")
+			env.mustExec(t, "INSERT INTO dataset1."+table+" (a, b) VALUES (1, 'x'), (2, 'y')")
+			setAlterFinishHook(func(string) string {
+				setAlterFinishHook(nil)
+				return "SELECT ERROR('second step failed')"
+			})
+			err := env.exec(mode, "INSERT INTO dataset1."+table+" (a, b) VALUES (3, 'z'); ALTER TABLE dataset1."+table+" ADD COLUMN c INT64; INSERT INTO dataset1."+table+" (a) VALUES (4)")
+			if err == nil || !strings.Contains(err.Error(), "second step failed") {
+				t.Fatalf("script: got %v", err)
+			}
+			md, err := env.client.Dataset("dataset1").Table(table).Metadata(env.ctx)
+			if err != nil || len(md.Schema) != 2 {
+				t.Fatalf("metadata: got %+v, %v", md, err)
+			}
+			check(t, table, 3)
+			if err := env.exec(mode, "SELECT 1; ALTER TABLE dataset1."+table+" ADD COLUMN c INT64"); err != nil {
+				t.Fatalf("next ALTER: %v", err)
+			}
+			check(t, table, 4)
+		})
+	}
+
 	// A statement that fails while the first step is analyzed changes
 	// nothing in googlesqlite's catalog, so nothing is repaired either: a
 	// repair would have to rewrite the spec and could lose its constraints.

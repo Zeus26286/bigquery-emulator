@@ -1768,7 +1768,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		defer r.server.alterMu.Unlock()
 		likePlan, planErr = planCreateTableLike(ctx, r.server, queryProjectID, datasetID, ddl.like, job.Configuration.Query.QueryParameters)
 	}
-	if planErr == nil && !job.Configuration.DryRun && looksLikeAlter(queryText) {
+	if planErr == nil && !job.Configuration.DryRun && !ddl.isScript() && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
 		// ALTER TABLE statements must not interleave.
 		r.server.alterMu.Lock()
@@ -1778,6 +1778,15 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText, job.Configuration.Query.QueryParameters)
 		runAlterBeforeRebuildHook(alterPlan)
 	}
+	script := newScriptDDL(r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, job.Configuration.DryRun, ddl)
+	if planErr == nil && ddl != nil && ddl.scriptRewrites {
+		// The CREATE TABLE ... LIKE and ALTER TABLE statements of the
+		// script run in statement handlers (script_ddl.go).
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+	}
+	// Registered before the transaction ends, so it runs after it.
+	defer script.repairFailed(ctx)
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -1827,7 +1836,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		// On error, response may carry the catalog changes of the
 		// statements that ran before the failure.
 		response, jobErr = r.server.contentRepo.Query(
-			ctx,
+			withScriptDDL(ctx, script),
 			tx,
 			queryProjectID,
 			datasetID,
@@ -1972,7 +1981,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
 		rewritePending = false
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, syncResponse, rewritePlan(alterPlan, likePlan), ddl, jobErr); err != nil {
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, job.Configuration.Query.QueryParameters, syncResponse, queryRewritePlan(alterPlan, likePlan, script, syncResponse), ddl, jobErr); err != nil {
 			return nil, err
 		}
 	}
@@ -2191,7 +2200,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		defer r.server.alterMu.Unlock()
 		likePlan, planErr = planCreateTableLike(ctx, r.server, queryProjectID, datasetID, ddl.like, r.queryRequest.QueryParameters)
 	}
-	if planErr == nil && !r.queryRequest.DryRun && looksLikeAlter(queryText) {
+	if planErr == nil && !r.queryRequest.DryRun && !ddl.isScript() && looksLikeAlter(queryText) {
 		// The plan is built from the metadata before the rebuild runs, so
 		// ALTER TABLE statements must not interleave.
 		r.server.alterMu.Lock()
@@ -2201,6 +2210,15 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		alterPlan, planErr = planAlterTable(ctx, r.server, queryProjectID, datasetID, queryText, r.queryRequest.QueryParameters)
 		runAlterBeforeRebuildHook(alterPlan)
 	}
+	script := newScriptDDL(r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, r.queryRequest.DryRun, ddl)
+	if planErr == nil && ddl != nil && ddl.scriptRewrites {
+		// The CREATE TABLE ... LIKE and ALTER TABLE statements of the
+		// script run in statement handlers (script_ddl.go).
+		r.server.alterMu.Lock()
+		defer r.server.alterMu.Unlock()
+	}
+	// Registered before the transaction ends, so it runs after it.
+	defer script.repairFailed(ctx)
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, err
@@ -2249,7 +2267,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		queryErr = translateQueryError(queryErr, queryProjectID, ddl)
 	default:
 		response, queryErr = r.server.contentRepo.Query(
-			ctx,
+			withScriptDDL(ctx, script),
 			tx,
 			queryProjectID,
 			datasetID,
@@ -2269,7 +2287,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 			if err := tx.Commit(); err != nil {
 				logger.Logger(ctx).Error("failed to commit a failed query", zap.Error(err))
 			} else {
-				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, nil, ddl, queryErr)
+				_ = syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, script.rewritePlan(changedCatalogOf(response)), ddl, queryErr)
 			}
 		}
 		if alterPlan != nil || likePlan != nil {
@@ -2363,7 +2381,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 			return nil, err
 		}
 		rewritePending = false
-		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, rewritePlan(alterPlan, likePlan), ddl, nil); err != nil {
+		if err := syncQueryCatalog(ctx, r.server, queryProjectID, datasetID, r.queryRequest.QueryParameters, response, queryRewritePlan(alterPlan, likePlan, script, response), ddl, nil); err != nil {
 			return nil, err
 		}
 	}
