@@ -63,6 +63,20 @@ func TestUnusedQueryParametersAreIgnored(t *testing.T) {
 			params: []bigquery.QueryParameter{{Name: "p", Value: 4}, {Name: "q", Value: 1}},
 			want:   [][]bigquery.Value{{int64(4)}},
 		},
+		// Script variables can leak between queries on the shared env,
+		// so each script case declares its own variable names.
+		{
+			name:   "script_declare_positional",
+			sql:    "DECLARE d INT64 DEFAULT ?; SELECT ?, d",
+			params: []bigquery.QueryParameter{{Value: 4}, {Value: 5}},
+			want:   [][]bigquery.Value{{int64(5), int64(4)}},
+		},
+		{
+			name:   "script_declare_bool",
+			sql:    "DECLARE flag BOOL DEFAULT @b; SELECT flag AND TRUE",
+			params: []bigquery.QueryParameter{{Name: "b", Value: true}},
+			want:   [][]bigquery.Value{{true}},
+		},
 	}
 	for _, mode := range ddlModes {
 		for _, tc := range cases {
