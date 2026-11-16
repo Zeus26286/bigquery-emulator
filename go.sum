@@ -52,8 +52,8 @@ github.com/Masterminds/semver/v3 v3.2.1 h1:RN9w6+7QoMeJVGyfmbcgs28Br8cvmnucEXnY0
 github.com/Masterminds/semver/v3 v3.2.1/go.mod h1:qvl/7zhW3nngYb5+80sSMF+FG2BjYrf8m9wsX0PNOMQ=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
-github.com/Zeus26286/googlesqlite v0.3.2-0.20261116131730-a1db9090c103 h1:xwzwGbCkYh2SO3+ObVlmEZ+Jk1IWBFrJTKVDpy/28Lw=
-github.com/Zeus26286/googlesqlite v0.3.2-0.20261116131730-a1db9090c103/go.mod h1:6ZfgyFZkEDl0smViR0ZvVZjKm2sT2hpD/XbXDxtM7+w=
+github.com/Zeus26286/googlesqlite v0.3.2-0.20261116161529-5455164c83d1 h1:Prrc8h+o7t///XBOa9rZ03bYb4YT0SwXLRJkNzgP00k=
+github.com/Zeus26286/googlesqlite v0.3.2-0.20261116161529-5455164c83d1/go.mod h1:6ZfgyFZkEDl0smViR0ZvVZjKm2sT2hpD/XbXDxtM7+w=
 github.com/alecthomas/assert/v2 v2.10.0 h1:jjRCHsj6hBJhkmhznrCzoNpbA3zqy0fYiUcYZP/GkPY=
 github.com/alecthomas/assert/v2 v2.10.0/go.mod h1:Bze95FyfUr7x34QZrjL+XP+0qgp/zg8yS+TtBj1WA3k=
 github.com/alecthomas/repr v0.4.0 h1:GhI2A8MACjfegCPVq9f1FLvIBS+DrQ2KQBFZP1iFzXc=
