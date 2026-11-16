@@ -1,7 +1,9 @@
 package server_test
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"cloud.google.com/go/bigquery"
@@ -55,52 +57,89 @@ func TestUnusedQueryParametersAreIgnored(t *testing.T) {
 			params: []bigquery.QueryParameter{{Value: 7}, {Value: 8}},
 			want:   [][]bigquery.Value{{int64(7)}},
 		},
+		{
+			name:   "script_declare_named",
+			sql:    "DECLARE x INT64 DEFAULT @p; SELECT x",
+			params: []bigquery.QueryParameter{{Name: "p", Value: 4}, {Name: "q", Value: 1}},
+			want:   [][]bigquery.Value{{int64(4)}},
+		},
 	}
 	for _, mode := range ddlModes {
 		for _, tc := range cases {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
-				q := env.client.Query(tc.sql)
-				q.Parameters = tc.params
-				var it *bigquery.RowIterator
-				if mode == "jobs.insert" {
-					job, err := q.Run(env.ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					status, err := job.Wait(env.ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := status.Err(); err != nil {
-						t.Fatal(err)
-					}
-					it, err = job.Read(env.ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-				} else {
-					var err error
-					it, err = q.Read(env.ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-				var rows [][]bigquery.Value
-				for {
-					var row []bigquery.Value
-					err := it.Next(&row)
-					if err == iterator.Done {
-						break
-					}
-					if err != nil {
-						t.Fatal(err)
-					}
-					rows = append(rows, row)
+				rows, err := env.readParamQuery(mode, tc.sql, tc.params)
+				if err != nil {
+					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(rows, tc.want) {
 					t.Fatalf("got rows %v, want %v", rows, tc.want)
 				}
 			})
 		}
+	}
+}
+
+// TestUnusedQueryParametersInDDLAndDML runs DDL and DML statements with a
+// query parameter they never reference.
+func TestUnusedQueryParametersInDDLAndDML(t *testing.T) {
+	env := newDDLTestEnv(t)
+	unused := []bigquery.QueryParameter{{Name: "unused", Value: 1}}
+	for _, mode := range ddlModes {
+		t.Run(mode, func(t *testing.T) {
+			table := "dataset1.unused_params_" + strings.ReplaceAll(mode, ".", "_")
+			for _, sql := range []string{
+				fmt.Sprintf("CREATE TABLE %s (a INT64)", table),
+				fmt.Sprintf("INSERT INTO %s (a) VALUES (1)", table),
+			} {
+				if _, err := env.readParamQuery(mode, sql, unused); err != nil {
+					t.Fatalf("%s: %v", sql, err)
+				}
+			}
+			rows := env.mustRead(t, fmt.Sprintf("SELECT a FROM %s", table))
+			if want := [][]bigquery.Value{{int64(1)}}; !reflect.DeepEqual(rows, want) {
+				t.Fatalf("got rows %v, want %v", rows, want)
+			}
+		})
+	}
+}
+
+// readParamQuery runs sql with params through the API named by mode and
+// returns its rows.
+func (e *ddlTestEnv) readParamQuery(mode, sql string, params []bigquery.QueryParameter) ([][]bigquery.Value, error) {
+	q := e.client.Query(sql)
+	q.Parameters = params
+	var it *bigquery.RowIterator
+	if mode == "jobs.insert" {
+		job, err := q.Run(e.ctx)
+		if err != nil {
+			return nil, err
+		}
+		status, err := job.Wait(e.ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := status.Err(); err != nil {
+			return nil, err
+		}
+		if it, err = job.Read(e.ctx); err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		if it, err = q.Read(e.ctx); err != nil {
+			return nil, err
+		}
+	}
+	var rows [][]bigquery.Value
+	for {
+		var row []bigquery.Value
+		err := it.Next(&row)
+		if err == iterator.Done {
+			return rows, nil
+		}
+		if err != nil {
+			return rows, err
+		}
+		rows = append(rows, row)
 	}
 }
