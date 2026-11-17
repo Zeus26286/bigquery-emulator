@@ -44,6 +44,15 @@ type ddlInfo struct {
 	// like is the statement when the query is a standalone CREATE TABLE
 	// ... LIKE, which the emulator runs itself (see create_table_like.go).
 	like *createLikeDDL
+	// scriptRewrites is set when a multi-statement script contains CREATE
+	// TABLE ... LIKE or ALTER TABLE, which run in statement handlers
+	// (script_ddl.go).
+	scriptRewrites bool
+}
+
+// isScript reports whether the query is a multi-statement script.
+func (d *ddlInfo) isScript() bool {
+	return d != nil && d.statements > 1
 }
 
 // createLikeDDL is a CREATE TABLE ... LIKE statement.
@@ -126,23 +135,15 @@ var partitionColumnTypes = map[string]string{
 
 var ddlKeywordPattern = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\b`)
 
-// errAlterInScript rejects ALTER TABLE inside a multi-statement script.
-// Splitting the script into statements run one by one would break script
-// variables, temp tables, control flow and the result of the last statement,
-// and a rebuild planned before the script ran cannot see what the statements
-// before the ALTER TABLE did.
-//
-// TODO(googlesqlite): implement ALTER TABLE (no upstream issue yet; it runs
-// as a no-op). Scripts can then be left to googlesqlite.
-var errAlterInScript = fmt.Errorf("ALTER TABLE inside a multi-statement script is not supported by the emulator; run each ALTER TABLE as a separate query")
+// errAlterInBlock rejects ALTER TABLE inside a block of a script (IF, LOOP,
+// BEGIN ... END, ...). A top-level ALTER TABLE of a script runs in a
+// googlesqlite statement handler (script_ddl.go), but googlesqlite does not
+// run the statements of a block.
+var errAlterInBlock = fmt.Errorf("ALTER TABLE inside a block of a multi-statement script is not supported by the emulator; run it at the top level of the script")
 
-// errLikeInScript rejects CREATE TABLE ... LIKE inside a multi-statement
-// script, for the reasons of errAlterInScript: the emulator plans it from the
-// metadata before the query runs.
-//
-// TODO(googlesqlite): implement CREATE TABLE LIKE (goccy/googlesqlite#74,
-// PR #75). Scripts can then be left to googlesqlite.
-var errLikeInScript = fmt.Errorf("CREATE TABLE ... LIKE inside a multi-statement script is not supported by the emulator; run it as a separate query")
+// errLikeInBlock rejects CREATE TABLE ... LIKE inside a block of a script,
+// for the reasons of errAlterInBlock.
+var errLikeInBlock = fmt.Errorf("CREATE TABLE ... LIKE inside a block of a multi-statement script is not supported by the emulator; run it at the top level of the script")
 
 // ddlParserOptions are the parser options of the emulator's own parse of
 // DDL statements. They are built once: every object allocated in the
@@ -250,8 +251,11 @@ func (a *ddlAnalyzer) walk(node googlesql.ASTNode, topLevel bool) error {
 		a.info.createsSchema = true
 		return nil
 	case *googlesql.ASTAlterTableStatement:
-		if !topLevel || a.info.statements != 1 {
-			return errAlterInScript
+		if !topLevel {
+			return errAlterInBlock
+		}
+		if a.info.statements != 1 {
+			a.info.scriptRewrites = true
 		}
 		return nil
 	case *googlesql.ASTCreateTableStatement:
@@ -379,12 +383,13 @@ func (a *ddlAnalyzer) createTable(node *googlesql.ASTCreateTableStatement, topLe
 	return nil
 }
 
-// createTableLike records a CREATE TABLE ... LIKE statement, which googlesqlite
-// rejects and the emulator runs itself. It is also recorded as a CREATE of
-// its table, so that checkDatasets and translateQueryError know the table.
+// createTableLike records a CREATE TABLE ... LIKE statement, which the
+// emulator runs itself: standalone, or in a statement handler inside a script.
+// It is also recorded as a CREATE of its table, so that checkDatasets and
+// translateQueryError know the table.
 func (a *ddlAnalyzer) createTableLike(node *googlesql.ASTCreateTableStatement, likeName *googlesql.ASTPathExpression, topLevel bool) error {
-	if !topLevel || a.info.statements != 1 {
-		return errLikeInScript
+	if !topLevel {
+		return errLikeInBlock
 	}
 	unsupported := func(feature string) error {
 		return fmt.Errorf("CREATE TABLE ... LIKE: %s is not supported by the emulator", feature)
@@ -455,7 +460,11 @@ func (a *ddlAnalyzer) createTableLike(node *googlesql.ASTCreateTableStatement, l
 		}
 		like.queryText = text
 	}
-	a.info.like = like
+	if a.info.statements == 1 {
+		a.info.like = like
+	} else {
+		a.info.scriptRewrites = true
+	}
 	a.info.creates = append(a.info.creates, &createTableDDL{ref: ref, columns: map[string]*columnAnnotation{}})
 	return nil
 }
@@ -1107,11 +1116,7 @@ func evalOptionExpr(ctx context.Context, server *Server, projectID, datasetID st
 	default:
 		return fmt.Errorf("option %s cannot be evaluated", option.name)
 	}
-	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
+	tx, err := beginDDLTx(ctx, server, projectID, datasetID)
 	if err != nil {
 		return err
 	}

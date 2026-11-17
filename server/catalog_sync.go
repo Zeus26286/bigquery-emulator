@@ -69,9 +69,10 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		return result, nil
 	}
 
-	// Load every project before writing anything: FindProject reads the
-	// metadata through another connection, which can be blocked by the
-	// uncommitted writes of the transaction below.
+	// Load every project before writing anything: outside a script,
+	// FindProject reads the metadata through another connection, which can
+	// be blocked by the uncommitted writes of the transaction below. Inside
+	// a script (ddl_scope.go), both run on the script's connection.
 	projects := map[string]*metadata.Project{}
 	var firstProjectID string
 	for _, spec := range append(append([]*googlesqlite.TableSpec{}, deleted...), added...) {
@@ -79,7 +80,7 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		if _, exists := projects[projectID]; exists {
 			continue
 		}
-		project, err := server.metaRepo.FindProject(ctx, projectID)
+		project, err := findProjectForDDL(ctx, server, projectID)
 		if err != nil {
 			return nil, err
 		}
@@ -96,11 +97,7 @@ func syncCatalog(ctx context.Context, server *Server, cat *googlesqlite.ChangedC
 		return project, project.Dataset(spec.NamePath[1])
 	}
 
-	conn, err := server.connMgr.Connection(ctx, firstProjectID, "")
-	if err != nil {
-		return nil, err
-	}
-	tx, err := conn.Begin(ctx)
+	tx, err := beginDDLTx(ctx, server, firstProjectID, "")
 	if err != nil {
 		return nil, err
 	}

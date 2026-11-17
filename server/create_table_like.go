@@ -33,12 +33,13 @@ import (
 // the columns of the source table by name, and its rows are inserted into the
 // new table.
 //
-// CREATE TABLE ... LIKE inside a multi-statement script is rejected
-// (analyzeDDL). Statements are serialized with ALTER TABLE (Server.alterMu).
+// Inside a multi-statement script, the same plan runs in a googlesqlite
+// statement handler (script_ddl.go); inside a block of a script, CREATE TABLE
+// ... LIKE is rejected (analyzeDDL). Statements are serialized with ALTER
+// TABLE (Server.alterMu).
 //
-// TODO(googlesqlite): goccy/googlesqlite#74 (PR #75) adds CREATE TABLE LIKE.
-// When upgrading to a version that has it, make sure that LIKE still reaches
-// this layer first, since googlesqlite would not copy the metadata.
+// googlesqlite can run CREATE TABLE ... LIKE itself, but would not copy the
+// metadata, so a LIKE must keep reaching this layer first.
 
 // likeTmpTablePrefix starts the name of the table the rows of an AS query go
 // through.
@@ -85,7 +86,7 @@ func planCreateTableLike(ctx context.Context, server *Server, projectID, dataset
 	srcName := fmt.Sprintf("%s:%s.%s", srcRef.ProjectId, srcRef.DatasetId, srcRef.TableId)
 	dstName := fmt.Sprintf("%s:%s.%s", dstRef.ProjectId, dstRef.DatasetId, dstRef.TableId)
 
-	srcProject, err := server.metaRepo.FindProject(ctx, srcRef.ProjectId)
+	srcProject, err := findProjectForDDL(ctx, server, srcRef.ProjectId)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +117,7 @@ func planCreateTableLike(ctx context.Context, server *Server, projectID, dataset
 	// checkDatasets checked the dataset of the new table.
 	dstProject := srcProject
 	if dstRef.ProjectId != srcRef.ProjectId {
-		if dstProject, err = server.metaRepo.FindProject(ctx, dstRef.ProjectId); err != nil {
+		if dstProject, err = findProjectForDDL(ctx, server, dstRef.ProjectId); err != nil {
 			return nil, err
 		}
 	}
@@ -622,7 +623,7 @@ func (p *createLikePlan) applyMetadata(ctx context.Context, server *Server) erro
 		return nil
 	}
 	dst := p.like.ref
-	project, err := server.metaRepo.FindProject(ctx, dst.ProjectId)
+	project, err := findProjectForDDL(ctx, server, dst.ProjectId)
 	if err != nil {
 		return err
 	}
@@ -630,11 +631,7 @@ func (p *createLikePlan) applyMetadata(ctx context.Context, server *Server) erro
 		return fmt.Errorf("dataset of table %s:%s.%s is not found", dst.ProjectId, dst.DatasetId, dst.TableId)
 	}
 	dataset := project.Dataset(dst.DatasetId)
-	conn, err := server.connMgr.Connection(ctx, dst.ProjectId, dst.DatasetId)
-	if err != nil {
-		return err
-	}
-	tx, err := conn.Begin(ctx)
+	tx, err := beginDDLTx(ctx, server, dst.ProjectId, dst.DatasetId)
 	if err != nil {
 		return err
 	}

@@ -35,6 +35,9 @@ type Tx struct {
 	tx        *sql.Tx
 	conn      *Conn
 	committed bool
+	// keepConn is set when the connection belongs to someone else: ending
+	// the transaction does not close it.
+	keepConn bool
 }
 
 func (t *Tx) Tx() *sql.Tx {
@@ -45,6 +48,10 @@ func (t *Tx) RollbackIfNotCommitted() error {
 	if t.committed {
 		return nil
 	}
+	if t.keepConn {
+		t.committed = true
+		return t.tx.Rollback()
+	}
 	defer t.conn.Conn.Close()
 	return t.tx.Rollback()
 }
@@ -54,7 +61,9 @@ func (t *Tx) Commit() error {
 		return err
 	}
 	t.committed = true
-	t.conn.Conn.Close()
+	if !t.keepConn {
+		t.conn.Conn.Close()
+	}
 	return nil
 }
 
@@ -114,4 +123,15 @@ func (c *Conn) Begin(ctx context.Context) (*Tx, error) {
 		return nil, err
 	}
 	return &Tx{tx: tx, conn: c}, nil
+}
+
+// BeginKeepingConn starts a transaction on c whose end does not close c.
+// It is for a connection that belongs to someone else, such as the one a
+// googlesqlite statement handler gets.
+func (c *Conn) BeginKeepingConn(ctx context.Context) (*Tx, error) {
+	tx, err := c.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Tx{tx: tx, conn: c, keepConn: true}, nil
 }

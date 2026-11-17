@@ -599,13 +599,11 @@ func TestAlterTableEdgeCases(t *testing.T) {
 		assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "cmt"), "a", "b", "c")
 	})
 
-	t.Run("multi_statement_script_is_rejected", func(t *testing.T) {
-		// Documented limitation: ALTER TABLE inside a multi-statement
-		// script is rejected, and nothing in the script runs.
+	t.Run("multi_statement_script", func(t *testing.T) {
 		env.mustExec(t, "jobs.insert", "CREATE TABLE dataset1.ms (a INT64)")
-		assertErrContains(t, env.runQueryJob(t, "ALTER TABLE dataset1.ms ADD COLUMN b STRING; INSERT INTO dataset1.ms (a) VALUES (7)"), "ALTER TABLE inside a multi-statement script is not supported")
-		assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "ms"), "a")
-		if rows := env.mustRead(t, "SELECT * FROM dataset1.ms"); len(rows) != 0 {
+		env.mustExec(t, "jobs.insert", "ALTER TABLE dataset1.ms ADD COLUMN b STRING; INSERT INTO dataset1.ms (a, b) VALUES (7, 'x')")
+		assertNames(t, "schema", env.tableSchemaNames(t, "dataset1", "ms"), "a", "b")
+		if rows := env.mustRead(t, "SELECT a, b FROM dataset1.ms"); len(rows) != 1 || rows[0][1] != "x" {
 			t.Fatalf("rows: got %v", rows)
 		}
 	})

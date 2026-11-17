@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/goccy/googlesqlite"
+
+	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
 )
 
 // ddlRewritePlan is a DDL statement the emulator runs itself instead of
@@ -41,4 +43,21 @@ func rewritePlan(alterPlan *alterTablePlan, likePlan *createLikePlan) ddlRewrite
 		return likePlan
 	}
 	return nil
+}
+
+// queryRewritePlan returns the plan of a query: the standalone statement the
+// emulator ran itself, or else the statements the handlers ran in its script.
+// response is the response of the query.
+func queryRewritePlan(alterPlan *alterTablePlan, likePlan *createLikePlan, script *scriptDDL, response *internaltypes.QueryResponse) ddlRewritePlan {
+	if plan := rewritePlan(alterPlan, likePlan); plan != nil {
+		return plan
+	}
+	return script.rewritePlan(changedCatalogOf(response))
+}
+
+func changedCatalogOf(response *internaltypes.QueryResponse) *googlesqlite.ChangedCatalog {
+	if response == nil {
+		return nil
+	}
+	return response.ChangedCatalog
 }
