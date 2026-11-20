@@ -158,3 +158,8 @@ require (
 )
 
 replace github.com/goccy/googlesqlite => github.com/Zeus26286/googlesqlite v0.3.2-0.20261117133739-232bc978334e
+
+// Zeus26286/go-googlesql is go-googlesql v0.4.0 plus a fix that slices
+// the wasm memory with uint32 addresses, so a wasm heap past 2 GiB no
+// longer panics with "slice bounds out of range [-2147...:]".
+replace github.com/goccy/go-googlesql => github.com/Zeus26286/go-googlesql v0.0.0-20261120091429-3e76f25f78d2
