@@ -52,6 +52,8 @@ github.com/Masterminds/semver/v3 v3.2.1 h1:RN9w6+7QoMeJVGyfmbcgs28Br8cvmnucEXnY0
 github.com/Masterminds/semver/v3 v3.2.1/go.mod h1:qvl/7zhW3nngYb5+80sSMF+FG2BjYrf8m9wsX0PNOMQ=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
+github.com/Zeus26286/go-googlesql v0.0.0-20261120091429-3e76f25f78d2 h1:QukmqMZH9PFDFYg+35bE4rckeZw4DDn+OJxuCooijb8=
+github.com/Zeus26286/go-googlesql v0.0.0-20261120091429-3e76f25f78d2/go.mod h1:Sgd8Ll78m7u2rhi+OK7ib/IC4NuGHdyOk7FcABqb3/w=
 github.com/Zeus26286/googlesqlite v0.3.2-0.20261117133739-232bc978334e h1:RwDXQBx3QPqeb/PBAguG8gF8WG5i71upO8/oWhzNAeo=
 github.com/Zeus26286/googlesqlite v0.3.2-0.20261117133739-232bc978334e/go.mod h1:qDVdMDn398qdVeQStOaOGxOHygeU2S/OZy6mGKsOdAw=
 github.com/alecthomas/assert/v2 v2.10.0 h1:jjRCHsj6hBJhkmhznrCzoNpbA3zqy0fYiUcYZP/GkPY=
@@ -146,8 +148,6 @@ github.com/go-playground/validator/v10 v10.30.2 h1:JiFIMtSSHb2/XBUbWM4i/MpeQm9ZK
 github.com/go-playground/validator/v10 v10.30.2/go.mod h1:mAf2pIOVXjTEBrwUMGKkCWKKPs9NheYGabeB04txQSc=
 github.com/go-sourcemap/sourcemap v2.1.4+incompatible h1:a+iTbH5auLKxaNwQFg0B+TCYl6lbukKPc7b5x0n1s6Q=
 github.com/go-sourcemap/sourcemap v2.1.4+incompatible/go.mod h1:F8jJfvm2KbVjc5NqelyYJmf/v5J0dwNLS2mL4sNA1Jg=
-github.com/goccy/go-googlesql v0.4.0 h1:kNPiBuBQ5QWhYElLFb+5aohFtSqHOl61eLUDg5mOoiA=
-github.com/goccy/go-googlesql v0.4.0/go.mod h1:Sgd8Ll78m7u2rhi+OK7ib/IC4NuGHdyOk7FcABqb3/w=
 github.com/goccy/go-json v0.10.6 h1:p8HrPJzOakx/mn/bQtjgNjdTcN+/S6FcG2CTtQOrHVU=
 github.com/goccy/go-json v0.10.6/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
 github.com/goccy/go-yaml v1.19.2 h1:PmFC1S6h8ljIz6gMRBopkjP1TVT7xuwrButHID66PoM=
